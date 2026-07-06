@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <title>Tab Decider</title>
+<link rel="icon" href="icons/icon-48.png" />
 <link rel="stylesheet" href="decider.css" />
 </head>
 <body>
@@ -18,6 +19,17 @@
   <section id="current-card" aria-live="polite">
     <p class="empty">Loading…</p>
   </section>
+
+  <div id="notice" class="notice" hidden></div>
+
+  <div id="duplicate-panel" class="duplicate-panel" hidden>
+    <p id="duplicate-summary" class="duplicate-summary"></p>
+    <ul id="duplicate-list" class="duplicate-list"></ul>
+    <div class="duplicate-actions">
+      <button id="duplicate-skip-btn" class="btn-neutral">Skip, keep them open</button>
+      <button id="duplicate-close-btn" class="btn-throw">Close selected</button>
+    </div>
+  </div>
 
   <div id="action-row">
     <button id="peek-btn" class="btn-neutral">Peek</button>
