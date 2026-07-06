@@ -1,7 +1,7 @@
 # Tab Decider
 
-[![Human in the Loop](https://madebyhuman.iamjarl.com/badges/loop-white.svg)](https://madebyhuman.iamjarl.com)
 [![Firefox Addon](https://img.shields.io/amo/v/tab-decider.svg?style=flat-square)](https://addons.mozilla.org/en-US/firefox/addon/tab-decider/)
+<a href="https://madebyhuman.iamjarl.com"><img src="https://madebyhuman.iamjarl.com/badges/loop-white.svg" alt="Human in the Loop" width="120" height="40"></a>
 
 > Step through your open tabs one at a time — **keep** (unload) or **throw** (close).
 
