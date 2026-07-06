@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Decider",
+  "version": "0.1.0",
+  "description": "Step through open tabs one at a time: keep (unload) or throw (close).",
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "permissions": ["tabs", "storage"],
+  "action": {
+    "default_title": "Tab Decider",
+    "default_icon": {
+      "48": "icons/icon-48.png",
+      "96": "icons/icon-96.png"
+    }
+  },
+  "commands": {
+    "decider-open": {
+      "suggested_key": { "default": "Alt+Shift+D" },
+      "description": "Open or focus the Tab Decider"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": { "id": "tab-decider@example.invalid" }
+  }
+}

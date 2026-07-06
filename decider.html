@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Tab Decider</title>
+<link rel="stylesheet" href="decider.css" />
+</head>
+<body>
+<div id="app">
+  <header id="app-header">
+    <h1>Tab Decider</h1>
+    <div id="progress">Loading…</div>
+    <button id="reset-btn" title="Clear all decisions and rebuild the queue from every open tab">
+      Forget decisions
+    </button>
+  </header>
+
+  <section id="current-card" aria-live="polite">
+    <p class="empty">Loading…</p>
+  </section>
+
+  <section id="debug-section">
+    <h2>Full queue <span class="tag">debug view — replaced by the review flow in Phase 2</span></h2>
+    <table id="queue-table">
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>URL</th>
+          <th>Domain</th>
+          <th>Pinned</th>
+          <th>Last accessed</th>
+        </tr>
+      </thead>
+      <tbody id="queue-body"></tbody>
+    </table>
+  </section>
+</div>
+<script src="decider.js"></script>
+</body>
+</html>
