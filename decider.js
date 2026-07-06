@@ -272,7 +272,11 @@ async function ensureNotActiveInWindow(tabId, windowId) {
   const siblings = await browser.tabs.query({ windowId, active: false });
   if (siblings.length === 0) return false;
 
-  await browser.tabs.update(siblings[0].id, { active: true });
+  // Prefer a sibling that's already loaded. Picking a discarded one would
+  // force Firefox to reload it just to make it "active" -- exactly the kind
+  // of needless reload this whole tool is trying to avoid.
+  const target = siblings.find((t) => !t.discarded) || siblings[0];
+  await browser.tabs.update(target.id, { active: true });
   return true;
 }
 

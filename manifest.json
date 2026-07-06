@@ -7,6 +7,10 @@
     "scripts": ["background.js"]
   },
   "permissions": ["tabs", "storage"],
+  "icons": {
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png"
+  },
   "action": {
     "default_title": "Tab Decider",
     "default_icon": {
