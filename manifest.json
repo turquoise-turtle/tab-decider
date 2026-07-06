@@ -21,6 +21,6 @@
     }
   },
   "browser_specific_settings": {
-    "gecko": { "id": "tab-decider@example.invalid" }
+    "gecko": { "id": "tab-decider@techniko.addons.mozilla.org" }
   }
 }

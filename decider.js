@@ -53,6 +53,10 @@ async function buildQueue(selfTabId) {
   const settings = await getSettings();
   const tabs = await browser.tabs.query({});
 
+  // Deliberately NOT persisting favIconUrl: some tabs carry data: URI
+  // favicons that can run tens of KB each, and storage.session has a hard
+  // 10MB quota. Favicons are cheap to re-fetch live at render time from a
+  // single tabs.query() instead, so the persisted queue stays tiny text.
   const entries = tabs
     .filter((t) => t.id !== selfTabId)
     .filter((t) => settings.includePinned || !t.pinned)
@@ -61,7 +65,6 @@ async function buildQueue(selfTabId) {
       windowId: t.windowId,
       url: t.url,
       title: t.title || t.url,
-      favIconUrl: t.favIconUrl || "",
       domain: computeDomain(t.url),
       pinned: !!t.pinned,
       discarded: !!t.discarded,
@@ -72,22 +75,33 @@ async function buildQueue(selfTabId) {
     entries.sort((a, b) => a.lastAccessed - b.lastAccessed);
   }
 
-  await browser.storage.session.set({
-    queue: entries,
-    history: [],
-    sessionActive: true,
-  });
+  try {
+    await browser.storage.session.set({
+      queue: entries,
+      history: [],
+      sessionActive: true,
+    });
+  } catch (err) {
+    els.progress.textContent = `Couldn't save the queue: ${err.message}`;
+    throw err;
+  }
   return entries;
 }
 
-function renderCurrentCard(entry) {
+async function getFaviconMap() {
+  const liveTabs = await browser.tabs.query({});
+  return new Map(liveTabs.map((t) => [t.id, t.favIconUrl || ""]));
+}
+
+function renderCurrentCard(entry, favIconById) {
   if (!entry) {
     els.currentCard.innerHTML = `<p class="empty">Queue is empty. Nice and tidy.</p>`;
     return;
   }
+  const favIconUrl = favIconById.get(entry.tabId) || "";
   els.currentCard.innerHTML = `
     <div class="card">
-      <img class="favicon" src="${escapeHtml(entry.favIconUrl)}" alt="" width="20" height="20"
+      <img class="favicon" src="${escapeHtml(favIconUrl)}" alt="" width="20" height="20"
            onerror="this.style.visibility='hidden'" />
       <div class="card-text">
         <div class="card-title">${escapeHtml(entry.title)}</div>
@@ -120,8 +134,9 @@ function renderDebugTable(entries) {
 async function render() {
   const { queue } = await browser.storage.session.get("queue");
   const entries = queue || [];
+  const favIconById = await getFaviconMap();
   els.progress.textContent = `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue`;
-  renderCurrentCard(entries[0]);
+  renderCurrentCard(entries[0], favIconById);
   renderDebugTable(entries);
 }
 
