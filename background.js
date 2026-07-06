@@ -46,13 +46,23 @@ browser.commands.onCommand.addListener((command) => {
   if (command === "decider-open") openOrFocusDecider();
 });
 
-// If the user closes some other tab manually while a review session is open,
-// drop it from the pending queue so it's never offered up as a decision.
+// If the user closes some other tab manually while a review session is
+// open, drop it from the pending queue so it's never offered up as a
+// decision. Also keeps `cursor` pointing at the same logical entry: since
+// Phase 4 lets you skip around instead of always deciding on index 0,
+// removing an entry that sat BEFORE the cursor would otherwise silently
+// shift everything after it and skip one. A no-op if decider.js's own
+// finalizeDecision already handled this same removal (idx === -1) -- the
+// two can race for the Throw case, but both compute the same end state.
 browser.tabs.onRemoved.addListener(async (tabId) => {
-  const { queue } = await browser.storage.session.get("queue");
+  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
   if (!queue || !queue.length) return;
+
+  const idx = queue.findIndex((entry) => entry.tabId === tabId);
+  if (idx === -1) return;
+
   const next = queue.filter((entry) => entry.tabId !== tabId);
-  if (next.length !== queue.length) {
-    await browser.storage.session.set({ queue: next });
-  }
+  const pos = cursor || 0;
+  const nextCursor = idx < pos ? Math.max(0, pos - 1) : pos;
+  await browser.storage.session.set({ queue: next, cursor: nextCursor });
 });

@@ -1,38 +1,51 @@
-// decider.js — Tab Decider (Phase 3)
+// decider.js — Tab Decider (Phase 4)
 //
-// Phase 1: queue building + display. Phase 2: real Keep/Throw actions.
-// Phase 3 (this pass): exact-URL duplicate detection, wired in after EITHER
-// Keep or Throw — an inline checklist appears before the queue advances.
-// Same-domain grouping is still Phase 4.
+// Phase 1: queue + display. Phase 2: real Keep/Throw. Phase 3: duplicate
+// detection (originally a post-decision confirm panel).
 //
-// Also fixes two Phase 2 bugs found in testing:
-//  1. Peek -> switch back -> Keep silently failed to unload. Firefox refuses
-//     to discard a window's *active* tab, and switching focus back to the
-//     decider's own window/tab does nothing to un-focus the peeked tab
-//     *within its own window* if that window is a different one. Fixed by
-//     ensureNotActiveInWindow(), which hands that window's active state to
-//     a sibling tab first (invisibly, since that window isn't the one in
-//     OS focus) so discard can actually succeed.
-//  2. innerHTML-based rendering was tripping the extension page's default
-//     CSP (script-src 'self') as a "blocked event handler" violation on
-//     Keep/Throw. No literal onclick="" was present anywhere in this file
-//     or decider.html, so the exact trigger is hard to pin down for
-//     certain -- it may be Firefox's own about:debugging reload overlay
-//     tripping the page's CSP, which would be cosmetic noise, not our bug.
-//     Either way, this rewrite builds the card and duplicate list via
-//     createElement/textContent instead of innerHTML, which removes any
-//     possible inline-markup CSP surface entirely regardless of the exact
-//     cause.
+// Phase 4 (this pass) changes the model in two ways:
 //
-// "Forget decisions" rebuilds from scratch: read all currently-open tabs,
-// ignore prior history, start clean. That's also exactly what happens
-// automatically on a full browser restart, because queue/history/
-// deciderTabId live in browser.storage.session, which the browser clears on
-// its own. browser.storage.local is only used for durable user settings
-// (includePinned, sortOrder).
+// 1. The queue is no longer strictly "decide index 0, remove it, repeat."
+//    There's now a `cursor` (a plain index into `queue`) so you can move
+//    around without deciding anything: Back/Skip by 1 or 10, or jump
+//    straight to a numbered position. This is what makes "reviewed count"
+//    and "jump to ~150" meaningful. Deciding Keep/Throw always acts on
+//    whatever's at the cursor, then removes that entry -- entries BEFORE
+//    the cursor that you skipped over are untouched and still sit in the
+//    queue for whenever you move back to them.
+//
+//    Position is necessarily approximate across a browser restart (which
+//    wipes all state by design -- see below): Peeking a tab bumps its
+//    lastAccessed to "now", which reshuffles the oldest-first sort order
+//    on the next rebuild. "Jump to 150" gets you in the neighborhood, not
+//    to the exact tab you were on -- which is the known, accepted tradeoff.
+//
+// 2. Duplicate-URL info is now live and non-blocking: it's computed fresh
+//    on every render of the current entry and shown right in view, with a
+//    "Close selected" action available at any time -- not gated behind
+//    making a Keep/Throw decision first, and no more separate confirm
+//    panel that pauses the queue.
+//
+// Same-domain grouping ("N other tabs from x.com -- review these next")
+// works the same way: computed against whatever's currently in `queue`
+// (regardless of position relative to the cursor), reordering the array to
+// move siblings to right after the current entry.
+//
+// State lives in browser.storage.session (queue, cursor, history,
+// duplicatesClosedTotal, deciderTabId) so it's automatically wiped when the
+// browser fully restarts -- by design, per "forget everything on restart."
+// browser.storage.local only holds durable user settings (includePinned,
+// sortOrder).
 
 const els = {
   progress: document.getElementById("progress"),
+  positionLabel: document.getElementById("position-label"),
+  jumpInput: document.getElementById("jump-input"),
+  jumpBtn: document.getElementById("jump-btn"),
+  stepBack10: document.getElementById("step-back-10"),
+  stepBack1: document.getElementById("step-back-1"),
+  stepFwd1: document.getElementById("step-fwd-1"),
+  stepFwd10: document.getElementById("step-fwd-10"),
   currentCard: document.getElementById("current-card"),
   notice: document.getElementById("notice"),
   resetBtn: document.getElementById("reset-btn"),
@@ -43,15 +56,15 @@ const els = {
   duplicatePanel: document.getElementById("duplicate-panel"),
   duplicateSummary: document.getElementById("duplicate-summary"),
   duplicateList: document.getElementById("duplicate-list"),
-  duplicateSkipBtn: document.getElementById("duplicate-skip-btn"),
   duplicateCloseBtn: document.getElementById("duplicate-close-btn"),
+  domainBanner: document.getElementById("domain-banner"),
+  domainBannerText: document.getElementById("domain-banner-text"),
+  domainBumpBtn: document.getElementById("domain-bump-btn"),
 };
 
-// Transient -- deliberately NOT persisted. If the decider page reloads mid
-// duplicate-review, worst case the prompt is lost and the next render just
-// shows the following queue item. Not worth persisting a few seconds of UI
-// state across a page reload that shouldn't happen anyway.
-let pendingDuplicateReview = null; // { entry, action, matches: [{tabId, title, sameWindow, checked}] }
+// Transient, recomputed on every render -- not persisted. Just lets the
+// "Close selected" button know which checkboxes are currently ticked.
+let currentDuplicateMatches = [];
 
 function showNotice(message) {
   els.notice.textContent = message;
@@ -96,10 +109,9 @@ async function buildQueue(selfTabId) {
   const settings = await getSettings();
   const tabs = await browser.tabs.query({});
 
-  // Deliberately NOT persisting favIconUrl: some tabs carry data: URI
-  // favicons that can run tens of KB each, and storage.session has a hard
-  // 10MB quota. Favicons are cheap to re-fetch live at render time from a
-  // single tabs.query() instead, so the persisted queue stays tiny text.
+  // Deliberately NOT persisting favIconUrl in the queue -- some tabs carry
+  // data: URI favicons tens of KB each, and storage.session has a 10MB
+  // quota. Favicons are re-fetched live at render time instead.
   const entries = tabs
     .filter((t) => t.id !== selfTabId)
     .filter((t) => settings.includePinned || !t.pinned)
@@ -122,19 +134,15 @@ async function buildQueue(selfTabId) {
     await browser.storage.session.set({
       queue: entries,
       history: [],
+      cursor: 0,
+      duplicatesClosedTotal: 0,
       sessionActive: true,
     });
   } catch (err) {
     els.progress.textContent = `Couldn't save the queue: ${err.message}`;
     throw err;
   }
-  pendingDuplicateReview = null;
   return entries;
-}
-
-async function getFaviconMap() {
-  const liveTabs = await browser.tabs.query({});
-  return new Map(liveTabs.map((t) => [t.id, t.favIconUrl || ""]));
 }
 
 function makeBadge(text, extraClass) {
@@ -201,15 +209,34 @@ function renderCurrentCard(entry, favIconById) {
   els.currentCard.appendChild(card);
 }
 
-function renderDuplicatePanel() {
-  els.currentCard.hidden = true;
-  els.actionRow.hidden = true;
-  els.duplicatePanel.hidden = false;
+// Live, non-blocking: recomputed against currently-open tabs on every
+// render of the current entry. Not tied to making a decision at all.
+function renderDuplicates(entry, liveTabs) {
+  if (!entry) {
+    els.duplicatePanel.hidden = true;
+    currentDuplicateMatches = [];
+    return;
+  }
 
-  const { matches } = pendingDuplicateReview;
+  const matches = liveTabs
+    .filter((t) => t.url === entry.url && t.id !== entry.tabId)
+    .map((t) => ({
+      tabId: t.id,
+      title: t.title || t.url,
+      sameWindow: t.windowId === entry.windowId,
+      checked: true,
+    }));
+
+  currentDuplicateMatches = matches;
+
+  if (matches.length === 0) {
+    els.duplicatePanel.hidden = true;
+    return;
+  }
+
+  els.duplicatePanel.hidden = false;
   els.duplicateSummary.textContent =
-    `${matches.length} other open tab${matches.length === 1 ? "" : "s"} ` +
-    `match this URL exactly -- close ${matches.length === 1 ? "it" : "them"} too?`;
+    `${matches.length} other open tab${matches.length === 1 ? "" : "s"} match this URL exactly.`;
 
   els.duplicateList.textContent = "";
   for (const m of matches) {
@@ -228,28 +255,63 @@ function renderDuplicatePanel() {
   }
 }
 
+// Also live and non-blocking: siblings are searched for across the whole
+// pending queue, not just what's ahead of the cursor.
+function renderDomainBanner(entry, entries) {
+  if (!entry || !entry.domain) {
+    els.domainBanner.hidden = true;
+    return;
+  }
+  const siblingCount = entries.filter((e) => e.domain === entry.domain && e.tabId !== entry.tabId).length;
+  if (siblingCount === 0) {
+    els.domainBanner.hidden = true;
+    return;
+  }
+  els.domainBanner.hidden = false;
+  els.domainBannerText.textContent =
+    `${siblingCount} other tab${siblingCount === 1 ? "" : "s"} from ${entry.domain} open.`;
+}
+
 async function render() {
   clearNotice();
 
-  if (pendingDuplicateReview) {
-    renderDuplicatePanel();
-    return;
+  const { queue, cursor, history, duplicatesClosedTotal } = await browser.storage.session.get([
+    "queue", "cursor", "history", "duplicatesClosedTotal",
+  ]);
+  const entries = queue || [];
+  const rawCursor = cursor || 0;
+  const pos = entries.length === 0 ? 0 : Math.max(0, Math.min(rawCursor, entries.length - 1));
+  if (pos !== rawCursor) {
+    await browser.storage.session.set({ cursor: pos }); // correct drift after external changes
   }
 
-  els.duplicatePanel.hidden = true;
-  els.currentCard.hidden = false;
-  els.actionRow.hidden = false;
+  const reviewedCount = (history || []).length;
+  const dupCount = duplicatesClosedTotal || 0;
+  els.progress.textContent =
+    `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue · ` +
+    `${reviewedCount} reviewed` +
+    (dupCount ? ` · ${dupCount} duplicate${dupCount === 1 ? "" : "s"} closed` : "") +
+    ` this session`;
 
-  const { queue } = await browser.storage.session.get("queue");
-  const entries = queue || [];
-  const favIconById = await getFaviconMap();
-  els.progress.textContent = `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue`;
-  renderCurrentCard(entries[0], favIconById);
+  els.positionLabel.textContent = entries.length ? `Viewing #${pos + 1} of ${entries.length}` : "Queue empty";
+  els.jumpInput.value = "";
 
-  const hasCurrent = entries.length > 0;
+  const entry = entries[pos];
+  const liveTabs = await browser.tabs.query({});
+  const favIconById = new Map(liveTabs.map((t) => [t.id, t.favIconUrl || ""]));
+
+  renderCurrentCard(entry, favIconById);
+  renderDuplicates(entry, liveTabs);
+  renderDomainBanner(entry, entries);
+
+  const hasCurrent = !!entry;
   els.peekBtn.disabled = !hasCurrent;
   els.keepBtn.disabled = !hasCurrent;
   els.throwBtn.disabled = !hasCurrent;
+  els.stepBack10.disabled = pos <= 0;
+  els.stepBack1.disabled = pos <= 0;
+  els.stepFwd1.disabled = !hasCurrent || pos >= entries.length - 1;
+  els.stepFwd10.disabled = !hasCurrent || pos >= entries.length - 1;
 }
 
 // Firefox refuses to discard a window's *active* tab (the promise just
@@ -274,67 +336,17 @@ async function ensureNotActiveInWindow(tabId, windowId) {
 
   // Prefer a sibling that's already loaded. Picking a discarded one would
   // force Firefox to reload it just to make it "active" -- exactly the kind
-  // of needless reload this whole tool is trying to avoid.
+  // of needless reload this tool is trying to avoid.
   const target = siblings.find((t) => !t.discarded) || siblings[0];
   await browser.tabs.update(target.id, { active: true });
   return true;
 }
 
-async function checkForDuplicates(entry, action) {
-  const liveTabs = await browser.tabs.query({});
-  const matches = liveTabs
-    .filter((t) => t.url === entry.url && t.id !== entry.tabId)
-    .map((t) => ({
-      tabId: t.id,
-      title: t.title || t.url,
-      sameWindow: t.windowId === entry.windowId,
-      checked: true,
-    }));
-
-  if (matches.length === 0) {
-    await finalizeDecision(entry, action, 0);
-    return;
-  }
-
-  pendingDuplicateReview = { entry, action, matches };
-  await render();
-}
-
-// Re-reads storage right before writing (rather than trusting variables
-// captured back when the decision started) because the duplicate-review
-// pause can take a while, during which background.js's tabs.onRemoved
-// pruning -- or another decision -- may have already changed things.
-async function finalizeDecision(entry, action, duplicatesClosed) {
-  const { queue, history } = await browser.storage.session.get(["queue", "history"]);
-  const currentQueue = queue || [];
-  const currentHistory = history || [];
-
-  // Throw already removes this entry via background.js's onRemoved
-  // listener; Keep needs it dropped explicitly since the tab is still open,
-  // just unloaded. Filtering by id (not slicing index 0) is safe either way.
-  const nextQueue = currentQueue.filter((e) => e.tabId !== entry.tabId);
-
-  const historyEntry = {
-    url: entry.url,
-    title: entry.title,
-    decision: action,
-    duplicatesClosed,
-    decidedAt: Date.now(),
-  };
-
-  await browser.storage.session.set({
-    queue: nextQueue,
-    history: [...currentHistory, historyEntry],
-  });
-
-  pendingDuplicateReview = null;
-  await render();
-}
-
 async function decide(action) {
-  const { queue } = await browser.storage.session.get("queue");
-  const currentQueue = queue || [];
-  const entry = currentQueue[0];
+  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
+  const entries = queue || [];
+  const pos = cursor || 0;
+  const entry = entries[pos];
   if (!entry) return;
 
   if (action === "keep") {
@@ -344,7 +356,7 @@ async function decide(action) {
         `"${entry.title}" is the only tab in its window, so Firefox can't unload it ` +
         `without leaving that window empty. Open another tab into that window, or Throw this one instead.`
       );
-      return; // leave it at the head of the queue rather than advancing
+      return; // leave it at the cursor rather than advancing
     }
     try {
       await browser.tabs.discard(entry.tabId);
@@ -366,13 +378,36 @@ async function decide(action) {
     }
   }
 
-  await checkForDuplicates(entry, action);
+  await finalizeDecision(entry, action);
 }
 
-async function confirmDuplicates() {
-  if (!pendingDuplicateReview) return;
-  const { entry, action, matches } = pendingDuplicateReview;
-  const toClose = matches.filter((m) => m.checked);
+// Re-reads storage right before writing (rather than trusting the entry
+// captured earlier) since background.js's tabs.onRemoved pruning can race
+// with this for the Throw case. Both compute the same end state (entry
+// gone, cursor adjusted the same way) so whichever writes last is fine.
+async function finalizeDecision(entry, action) {
+  const { queue, cursor, history } = await browser.storage.session.get(["queue", "cursor", "history"]);
+  const entries = queue || [];
+  const pos = cursor || 0;
+  const idx = entries.findIndex((e) => e.tabId === entry.tabId);
+
+  const nextQueue = idx === -1 ? entries : entries.filter((e) => e.tabId !== entry.tabId);
+  const nextCursor = idx !== -1 && idx < pos ? Math.max(0, pos - 1) : pos;
+
+  const historyEntry = { url: entry.url, title: entry.title, decision: action, decidedAt: Date.now() };
+
+  await browser.storage.session.set({
+    queue: nextQueue,
+    cursor: nextCursor,
+    history: [...(history || []), historyEntry],
+  });
+  await render();
+}
+
+async function closeDuplicates() {
+  const toClose = currentDuplicateMatches.filter((m) => m.checked);
+  if (toClose.length === 0) return;
+
   for (const m of toClose) {
     try {
       await browser.tabs.remove(m.tabId);
@@ -380,27 +415,79 @@ async function confirmDuplicates() {
       console.warn("Tab Decider: duplicate close failed", err);
     }
   }
-  await finalizeDecision(entry, action, toClose.length);
+
+  const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
+  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + toClose.length });
+
+  await render();
+  showNotice(`Closed ${toClose.length} duplicate tab${toClose.length === 1 ? "" : "s"}.`);
 }
 
-async function skipDuplicates() {
-  if (!pendingDuplicateReview) return;
-  const { entry, action } = pendingDuplicateReview;
-  await finalizeDecision(entry, action, 0);
+// Moves every other pending entry sharing the current tab's domain to
+// right after the current position, wherever they currently sit in the
+// queue (before or after the cursor).
+async function bumpDomainSiblings() {
+  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
+  const entries = (queue || []).slice();
+  const pos = cursor || 0;
+  const entry = entries[pos];
+  if (!entry || !entry.domain) return;
+
+  const siblingIndexes = [];
+  entries.forEach((e, i) => {
+    if (i !== pos && e.domain === entry.domain) siblingIndexes.push(i);
+  });
+  if (siblingIndexes.length === 0) return;
+
+  // Remove from the end first so earlier removals don't shift indexes we
+  // still need to pull out.
+  const siblings = [];
+  for (let i = siblingIndexes.length - 1; i >= 0; i--) {
+    siblings.unshift(entries.splice(siblingIndexes[i], 1)[0]);
+  }
+
+  const removedBeforePos = siblingIndexes.filter((i) => i < pos).length;
+  const newPos = pos - removedBeforePos;
+  entries.splice(newPos + 1, 0, ...siblings);
+
+  await browser.storage.session.set({ queue: entries, cursor: newPos });
+  await render();
+  showNotice(
+    `Moved ${siblings.length} tab${siblings.length === 1 ? "" : "s"} from ${entry.domain} to review right after this one.`
+  );
+}
+
+async function setCursor(newPos) {
+  const { queue } = await browser.storage.session.get("queue");
+  const entries = queue || [];
+  const clamped = entries.length === 0 ? 0 : Math.max(0, Math.min(newPos, entries.length - 1));
+  await browser.storage.session.set({ cursor: clamped });
+  await render();
+}
+
+async function stepCursor(delta) {
+  const { cursor } = await browser.storage.session.get("cursor");
+  await setCursor((cursor || 0) + delta);
+}
+
+async function jumpToInput() {
+  const raw = parseInt(els.jumpInput.value, 10);
+  if (Number.isNaN(raw)) return;
+  await setCursor(raw - 1); // input is shown/entered as 1-based
 }
 
 async function peekCurrent() {
-  const { queue } = await browser.storage.session.get("queue");
+  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
   const entries = queue || [];
-  const entry = entries[0];
+  const entry = entries[cursor || 0];
   if (!entry) return;
 
   try {
     await browser.tabs.update(entry.tabId, { active: true });
     await browser.windows.update(entry.windowId, { focused: true });
   } catch (err) {
-    // Tab's gone -- drop it rather than leaving the queue stuck on it.
-    await browser.storage.session.set({ queue: entries.slice(1) });
+    // Tab's gone -- background.js's onRemoved listener will prune it;
+    // just re-render so the UI catches up.
     await render();
   }
 }
@@ -424,8 +511,18 @@ async function init() {
   els.peekBtn.addEventListener("click", peekCurrent);
   els.keepBtn.addEventListener("click", () => decide("keep"));
   els.throwBtn.addEventListener("click", () => decide("throw"));
-  els.duplicateSkipBtn.addEventListener("click", skipDuplicates);
-  els.duplicateCloseBtn.addEventListener("click", confirmDuplicates);
+
+  els.duplicateCloseBtn.addEventListener("click", closeDuplicates);
+  els.domainBumpBtn.addEventListener("click", bumpDomainSiblings);
+
+  els.stepBack10.addEventListener("click", () => stepCursor(-10));
+  els.stepBack1.addEventListener("click", () => stepCursor(-1));
+  els.stepFwd1.addEventListener("click", () => stepCursor(1));
+  els.stepFwd10.addEventListener("click", () => stepCursor(10));
+  els.jumpBtn.addEventListener("click", jumpToInput);
+  els.jumpInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") jumpToInput();
+  });
 }
 
 init();

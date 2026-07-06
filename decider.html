@@ -16,20 +16,36 @@
     </button>
   </header>
 
+  <div id="position-bar">
+    <span id="position-label">—</span>
+    <div id="position-controls">
+      <button id="step-back-10" class="btn-neutral" title="Back 10">-10</button>
+      <button id="step-back-1" class="btn-neutral" title="Back 1">-1</button>
+      <input id="jump-input" type="number" min="1" placeholder="#" title="Jump to position" />
+      <button id="jump-btn" class="btn-neutral">Go</button>
+      <button id="step-fwd-1" class="btn-neutral" title="Skip 1">+1</button>
+      <button id="step-fwd-10" class="btn-neutral" title="Skip 10">+10</button>
+    </div>
+  </div>
+
   <section id="current-card" aria-live="polite">
     <p class="empty">Loading…</p>
   </section>
-
-  <div id="notice" class="notice" hidden></div>
 
   <div id="duplicate-panel" class="duplicate-panel" hidden>
     <p id="duplicate-summary" class="duplicate-summary"></p>
     <ul id="duplicate-list" class="duplicate-list"></ul>
     <div class="duplicate-actions">
-      <button id="duplicate-skip-btn" class="btn-neutral">Skip, keep them open</button>
       <button id="duplicate-close-btn" class="btn-throw">Close selected</button>
     </div>
   </div>
+
+  <div id="domain-banner" class="domain-banner" hidden>
+    <span id="domain-banner-text"></span>
+    <button id="domain-bump-btn" class="btn-neutral">Review these next</button>
+  </div>
+
+  <div id="notice" class="notice" hidden></div>
 
   <div id="action-row">
     <button id="peek-btn" class="btn-neutral">Peek</button>
