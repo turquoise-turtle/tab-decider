@@ -39,6 +39,10 @@
 
 const els = {
   progress: document.getElementById("progress"),
+  settingsToggleBtn: document.getElementById("settings-toggle-btn"),
+  settingsPanel: document.getElementById("settings-panel"),
+  settingIncludePinned: document.getElementById("setting-include-pinned"),
+  settingSortOrder: document.getElementById("setting-sort-order"),
   positionLabel: document.getElementById("position-label"),
   jumpInput: document.getElementById("jump-input"),
   jumpBtn: document.getElementById("jump-btn"),
@@ -57,9 +61,15 @@ const els = {
   duplicateSummary: document.getElementById("duplicate-summary"),
   duplicateList: document.getElementById("duplicate-list"),
   duplicateCloseBtn: document.getElementById("duplicate-close-btn"),
+  duplicateThrowAllBtn: document.getElementById("duplicate-throw-all-btn"),
   domainBanner: document.getElementById("domain-banner"),
   domainBannerText: document.getElementById("domain-banner-text"),
   domainBumpBtn: document.getElementById("domain-bump-btn"),
+  summaryCard: document.getElementById("summary-card"),
+  summaryKept: document.getElementById("summary-kept"),
+  summaryThrown: document.getElementById("summary-thrown"),
+  summaryDuplicates: document.getElementById("summary-duplicates"),
+  summaryRestartBtn: document.getElementById("summary-restart-btn"),
 };
 
 // Transient, recomputed on every render -- not persisted. Just lets the
@@ -105,6 +115,22 @@ async function getSettings() {
   return Object.assign({ includePinned: false, sortOrder: "lru" }, settings);
 }
 
+async function loadSettingsIntoUI() {
+  const settings = await getSettings();
+  els.settingIncludePinned.checked = settings.includePinned;
+  els.settingSortOrder.value = settings.sortOrder;
+}
+
+async function saveSettingsFromUI() {
+  const settings = {
+    includePinned: els.settingIncludePinned.checked,
+    sortOrder: els.settingSortOrder.value,
+  };
+  await browser.storage.local.set({ settings });
+  await rebuildAndRender();
+  showNotice("Settings updated -- queue rebuilt.");
+}
+
 async function buildQueue(selfTabId) {
   const settings = await getSettings();
   const tabs = await browser.tabs.query({});
@@ -143,6 +169,13 @@ async function buildQueue(selfTabId) {
     throw err;
   }
   return entries;
+}
+
+async function rebuildAndRender() {
+  els.progress.textContent = "Rebuilding...";
+  const selfTab = await browser.tabs.getCurrent();
+  await buildQueue(selfTab.id);
+  await render();
 }
 
 function makeBadge(text, extraClass) {
@@ -272,6 +305,14 @@ function renderDomainBanner(entry, entries) {
     `${siblingCount} other tab${siblingCount === 1 ? "" : "s"} from ${entry.domain} open.`;
 }
 
+function renderSummary(history, duplicatesClosedTotal) {
+  const kept = history.filter((h) => h.decision === "keep").length;
+  const thrown = history.filter((h) => h.decision === "throw").length;
+  els.summaryKept.textContent = String(kept);
+  els.summaryThrown.textContent = String(thrown);
+  els.summaryDuplicates.textContent = String(duplicatesClosedTotal);
+}
+
 async function render() {
   clearNotice();
 
@@ -279,21 +320,47 @@ async function render() {
     "queue", "cursor", "history", "duplicatesClosedTotal",
   ]);
   const entries = queue || [];
-  const rawCursor = cursor || 0;
-  const pos = entries.length === 0 ? 0 : Math.max(0, Math.min(rawCursor, entries.length - 1));
-  if (pos !== rawCursor) {
-    await browser.storage.session.set({ cursor: pos }); // correct drift after external changes
-  }
-
   const reviewedCount = (history || []).length;
   const dupCount = duplicatesClosedTotal || 0;
+
   els.progress.textContent =
     `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue · ` +
     `${reviewedCount} reviewed` +
     (dupCount ? ` · ${dupCount} duplicate${dupCount === 1 ? "" : "s"} closed` : "") +
     ` this session`;
 
-  els.positionLabel.textContent = entries.length ? `Viewing #${pos + 1} of ${entries.length}` : "Queue empty";
+  if (entries.length === 0) {
+    els.positionLabel.textContent = "Queue empty";
+    els.jumpInput.value = "";
+
+    els.currentCard.hidden = true;
+    els.duplicatePanel.hidden = true;
+    els.domainBanner.hidden = true;
+    els.actionRow.hidden = true;
+    els.summaryCard.hidden = false;
+    renderSummary(history || [], dupCount);
+
+    els.peekBtn.disabled = true;
+    els.keepBtn.disabled = true;
+    els.throwBtn.disabled = true;
+    els.stepBack10.disabled = true;
+    els.stepBack1.disabled = true;
+    els.stepFwd1.disabled = true;
+    els.stepFwd10.disabled = true;
+    return;
+  }
+
+  els.summaryCard.hidden = true;
+  els.currentCard.hidden = false;
+  els.actionRow.hidden = false;
+
+  const rawCursor = cursor || 0;
+  const pos = Math.max(0, Math.min(rawCursor, entries.length - 1));
+  if (pos !== rawCursor) {
+    await browser.storage.session.set({ cursor: pos }); // correct drift after external changes
+  }
+
+  els.positionLabel.textContent = `Viewing #${pos + 1} of ${entries.length}`;
   els.jumpInput.value = "";
 
   const entry = entries[pos];
@@ -304,14 +371,13 @@ async function render() {
   renderDuplicates(entry, liveTabs);
   renderDomainBanner(entry, entries);
 
-  const hasCurrent = !!entry;
-  els.peekBtn.disabled = !hasCurrent;
-  els.keepBtn.disabled = !hasCurrent;
-  els.throwBtn.disabled = !hasCurrent;
+  els.peekBtn.disabled = false;
+  els.keepBtn.disabled = false;
+  els.throwBtn.disabled = false;
   els.stepBack10.disabled = pos <= 0;
   els.stepBack1.disabled = pos <= 0;
-  els.stepFwd1.disabled = !hasCurrent || pos >= entries.length - 1;
-  els.stepFwd10.disabled = !hasCurrent || pos >= entries.length - 1;
+  els.stepFwd1.disabled = pos >= entries.length - 1;
+  els.stepFwd10.disabled = pos >= entries.length - 1;
 }
 
 // Firefox refuses to discard a window's *active* tab (the promise just
@@ -423,6 +489,40 @@ async function closeDuplicates() {
   showNotice(`Closed ${toClose.length} duplicate tab${toClose.length === 1 ? "" : "s"}.`);
 }
 
+// Closes the current entry AND every duplicate match together, regardless
+// of checkbox state -- "All" means all, unlike "Close selected" which
+// leaves the current tab's own Keep/Throw decision untouched. This counts
+// as a Throw decision on the current entry, so it advances the queue too.
+async function throwAllDuplicates() {
+  if (currentDuplicateMatches.length === 0) return;
+
+  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
+  const entries = queue || [];
+  const entry = entries[cursor || 0];
+  if (!entry) return;
+
+  const matches = currentDuplicateMatches.slice();
+
+  try {
+    await browser.tabs.remove(entry.tabId);
+  } catch (err) {
+    console.warn("Tab Decider: throw-all failed on current tab", err);
+  }
+  for (const m of matches) {
+    try {
+      await browser.tabs.remove(m.tabId);
+    } catch (err) {
+      console.warn("Tab Decider: throw-all failed on a duplicate", err);
+    }
+  }
+
+  const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
+  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + matches.length });
+
+  await finalizeDecision(entry, "throw");
+  showNotice(`Threw ${matches.length + 1} tabs -- this one plus ${matches.length} duplicate${matches.length === 1 ? "" : "s"}.`);
+}
+
 // Moves every other pending entry sharing the current tab's domain to
 // right after the current position, wherever they currently sit in the
 // queue (before or after the cursor).
@@ -496,23 +596,43 @@ async function init() {
   const selfTab = await browser.tabs.getCurrent();
   await browser.storage.session.set({ deciderTabId: selfTab.id });
 
+  await loadSettingsIntoUI();
+
   const { sessionActive } = await browser.storage.session.get("sessionActive");
   if (!sessionActive) {
     await buildQueue(selfTab.id);
   }
   await render();
 
-  els.resetBtn.addEventListener("click", async () => {
-    els.progress.textContent = "Rebuilding...";
-    await buildQueue(selfTab.id);
-    await render();
+  // Keyboard shortcuts are handled in background.js (global commands work
+  // regardless of which tab has focus) and relayed here as a message, so
+  // there's exactly one decide() implementation whether it was triggered by
+  // a click or Alt+Shift+K/T from wherever you Peeked to. Returning the
+  // decide() promise lets background.js's sendMessage() await full
+  // completion (decision + duplicate/domain re-render) before it brings
+  // this tab into focus.
+  browser.runtime.onMessage.addListener((message) => {
+    if (!message || message.type !== "decide") return;
+    return decide(message.action);
   });
+
+  els.resetBtn.addEventListener("click", rebuildAndRender);
+  els.summaryRestartBtn.addEventListener("click", rebuildAndRender);
+
+  els.settingsToggleBtn.addEventListener("click", () => {
+    const isHidden = els.settingsPanel.hidden;
+    els.settingsPanel.hidden = !isHidden;
+    els.settingsToggleBtn.setAttribute("aria-expanded", String(isHidden));
+  });
+  els.settingIncludePinned.addEventListener("change", saveSettingsFromUI);
+  els.settingSortOrder.addEventListener("change", saveSettingsFromUI);
 
   els.peekBtn.addEventListener("click", peekCurrent);
   els.keepBtn.addEventListener("click", () => decide("keep"));
   els.throwBtn.addEventListener("click", () => decide("throw"));
 
   els.duplicateCloseBtn.addEventListener("click", closeDuplicates);
+  els.duplicateThrowAllBtn.addEventListener("click", throwAllDuplicates);
   els.domainBumpBtn.addEventListener("click", bumpDomainSiblings);
 
   els.stepBack10.addEventListener("click", () => stepCursor(-10));

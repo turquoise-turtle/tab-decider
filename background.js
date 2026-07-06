@@ -40,10 +40,45 @@ async function openOrFocusDecider() {
   await browser.storage.session.set({ deciderTabId: tab.id });
 }
 
+// Relays a keyboard-triggered Keep/Throw to decider.js (which owns the one
+// real decide() implementation — no duplicating that logic here), waits for
+// it to actually finish deciding + re-rendering, then brings the decider
+// tab into focus so whatever happens next (e.g. a duplicate prompt, or the
+// next card) is immediately visible. This is what lets you Peek at a tab,
+// use the shortcut from there, and land back on the decider automatically.
+//
+// If there's no decider tab open at all, a shortcut isn't acting on
+// anything visible — just open one instead of guessing at stale queue
+// state from storage.
+async function relayDecision(action) {
+  const existing = await findExistingDeciderTab();
+  if (!existing) {
+    await openOrFocusDecider();
+    return;
+  }
+
+  try {
+    await browser.runtime.sendMessage({ type: "decide", action });
+  } catch (err) {
+    // decider.js's script context wasn't reachable (e.g. Firefox discarded
+    // that tab under memory pressure). Focusing it below will reload it via
+    // init(), and the user can just click the button once it's back.
+  }
+
+  await browser.tabs.update(existing.id, { active: true });
+  await browser.windows.update(existing.windowId, { focused: true });
+}
+
 browser.action.onClicked.addListener(openOrFocusDecider);
 
 browser.commands.onCommand.addListener((command) => {
-  if (command === "decider-open") openOrFocusDecider();
+  if (command === "decider-open") {
+    openOrFocusDecider();
+  } else if (command === "decider-keep") {
+    relayDecision("keep");
+  } else if (command === "decider-throw") {
+    relayDecision("throw");
+  }
 });
 
 // If the user closes some other tab manually while a review session is

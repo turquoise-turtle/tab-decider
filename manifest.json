@@ -22,6 +22,14 @@
     "decider-open": {
       "suggested_key": { "default": "Alt+Shift+D" },
       "description": "Open or focus the Tab Decider"
+    },
+    "decider-keep": {
+      "suggested_key": { "default": "Alt+Shift+K" },
+      "description": "Keep current tab (unload) and return to Tab Decider"
+    },
+    "decider-throw": {
+      "suggested_key": { "default": "Alt+Shift+T" },
+      "description": "Throw current tab (close) and return to Tab Decider"
     }
   },
   "browser_specific_settings": {
