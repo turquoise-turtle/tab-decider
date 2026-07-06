@@ -1,21 +1,26 @@
-// decider.js — Tab Decider (Phase 1)
+// decider.js — Tab Decider (Phase 2)
 //
-// Scope for this phase: build the review queue from every open tab (minus
-// this page and pinned tabs) and display it. No Keep/Throw actions yet —
-// this phase is just proving that we can read tab data correctly and that
-// the storage-backed queue survives a page reload.
+// Adds real Keep/Throw actions on top of Phase 1's queue-building: Keep
+// discards the tab (unloads it, stays open), Throw closes it. Either way the
+// decision is logged to history and the queue advances. Peek jumps focus to
+// the tab under review without deciding anything.
 //
-// "Forget decisions" is already wired up here since it's the same operation
-// as building the queue for the first time: read all currently-open tabs,
-// ignore any prior history, start clean. That's also exactly what happens
+// Duplicate-URL and same-domain checks are NOT wired up yet — that's Phase 3
+// and Phase 4. `duplicatesClosed` is hardcoded to 0 in the history entry
+// until then.
+//
+// "Forget decisions" rebuilds from scratch: read all currently-open tabs,
+// ignore prior history, start clean. That's also exactly what happens
 // automatically on a full browser restart, because queue/history/deciderTabId
 // live in browser.storage.session, which the browser clears on its own.
 
 const els = {
   progress: document.getElementById("progress"),
   currentCard: document.getElementById("current-card"),
-  queueBody: document.getElementById("queue-body"),
   resetBtn: document.getElementById("reset-btn"),
+  peekBtn: document.getElementById("peek-btn"),
+  keepBtn: document.getElementById("keep-btn"),
+  throwBtn: document.getElementById("throw-btn"),
 };
 
 function computeDomain(url) {
@@ -26,16 +31,6 @@ function computeDomain(url) {
   } catch {
     return null; // about:, file:, moz-extension:, etc. — no meaningful domain
   }
-}
-
-function formatLastAccessed(ms) {
-  if (!ms) return "—";
-  const diffMin = Math.round((Date.now() - ms) / 60000);
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  return `${Math.round(diffHr / 24)}d ago`;
 }
 
 function escapeHtml(s) {
@@ -116,28 +111,71 @@ function renderCurrentCard(entry, favIconById) {
   `;
 }
 
-function renderDebugTable(entries) {
-  els.queueBody.innerHTML = entries
-    .map(
-      (e) => `
-      <tr>
-        <td>${escapeHtml(e.title)}</td>
-        <td class="mono">${escapeHtml(e.url)}</td>
-        <td>${escapeHtml(e.domain || "—")}</td>
-        <td>${e.pinned ? "yes" : ""}</td>
-        <td>${formatLastAccessed(e.lastAccessed)}</td>
-      </tr>`
-    )
-    .join("");
-}
-
 async function render() {
   const { queue } = await browser.storage.session.get("queue");
   const entries = queue || [];
   const favIconById = await getFaviconMap();
   els.progress.textContent = `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue`;
   renderCurrentCard(entries[0], favIconById);
-  renderDebugTable(entries);
+
+  const hasCurrent = entries.length > 0;
+  els.peekBtn.disabled = !hasCurrent;
+  els.keepBtn.disabled = !hasCurrent;
+  els.throwBtn.disabled = !hasCurrent;
+}
+
+// Re-reads storage right before acting (rather than trusting a JS variable
+// from the last render) so we're always acting on the true current head —
+// background.js's tabs.onRemoved pruning could have changed things since.
+async function decide(action) {
+  const { queue, history } = await browser.storage.session.get(["queue", "history"]);
+  const currentQueue = queue || [];
+  const currentHistory = history || [];
+  const entry = currentQueue[0];
+  if (!entry) return;
+
+  try {
+    if (action === "keep") {
+      await browser.tabs.discard(entry.tabId);
+    } else if (action === "throw") {
+      await browser.tabs.remove(entry.tabId);
+    }
+  } catch (err) {
+    // Tab was probably already closed outside the extension — that's fine,
+    // just move on rather than getting stuck on a dead entry.
+    console.warn(`Tab Decider: ${action} failed for tab ${entry.tabId}`, err);
+  }
+
+  const historyEntry = {
+    url: entry.url,
+    title: entry.title,
+    decision: action,
+    duplicatesClosed: 0, // wired up in Phase 3
+    decidedAt: Date.now(),
+  };
+
+  await browser.storage.session.set({
+    queue: currentQueue.slice(1),
+    history: [...currentHistory, historyEntry],
+  });
+
+  await render();
+}
+
+async function peekCurrent() {
+  const { queue } = await browser.storage.session.get("queue");
+  const entries = queue || [];
+  const entry = entries[0];
+  if (!entry) return;
+
+  try {
+    await browser.tabs.update(entry.tabId, { active: true });
+    await browser.windows.update(entry.windowId, { focused: true });
+  } catch (err) {
+    // Tab's gone — drop it rather than leaving the queue stuck on it.
+    await browser.storage.session.set({ queue: entries.slice(1) });
+    await render();
+  }
 }
 
 async function init() {
@@ -155,6 +193,10 @@ async function init() {
     await buildQueue(selfTab.id);
     await render();
   });
+
+  els.peekBtn.addEventListener("click", peekCurrent);
+  els.keepBtn.addEventListener("click", () => decide("keep"));
+  els.throwBtn.addEventListener("click", () => decide("throw"));
 }
 
 init();

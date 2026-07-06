@@ -19,22 +19,13 @@
     <p class="empty">Loading…</p>
   </section>
 
-  <section id="debug-section">
-    <h2>Full queue <span class="tag">debug view — replaced by the review flow in Phase 2</span></h2>
-    <table id="queue-table">
-      <thead>
-        <tr>
-          <th>Title</th>
-          <th>URL</th>
-          <th>Domain</th>
-          <th>Pinned</th>
-          <th>Last accessed</th>
-        </tr>
-      </thead>
-      <tbody id="queue-body"></tbody>
-    </table>
-  </section>
+  <div id="action-row">
+    <button id="peek-btn" class="btn-neutral">Peek</button>
+    <button id="keep-btn" class="btn-keep">Keep</button>
+    <button id="throw-btn" class="btn-throw">Throw</button>
+  </div>
 </div>
 <script src="decider.js"></script>
 </body>
 </html>
+
