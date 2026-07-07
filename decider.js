@@ -43,6 +43,7 @@ const els = {
   settingsPanel: document.getElementById("settings-panel"),
   settingIncludePinned: document.getElementById("setting-include-pinned"),
   settingSortOrder: document.getElementById("setting-sort-order"),
+  shortcutsList: document.getElementById("shortcuts-list"),
   positionLabel: document.getElementById("position-label"),
   jumpInput: document.getElementById("jump-input"),
   jumpBtn: document.getElementById("jump-btn"),
@@ -131,6 +132,28 @@ async function saveSettingsFromUI() {
   showNotice("Settings updated -- queue rebuilt.");
 }
 
+// Reads the actual live bindings rather than hardcoding them, so this can't
+// go stale if the user rebinds shortcuts in about:addons -> Manage Extension
+// Shortcuts.
+async function renderShortcutsList() {
+  let commands = [];
+  try {
+    commands = await browser.commands.getAll();
+  } catch (err) {
+    console.warn("Tab Decider: couldn't read command shortcuts", err);
+  }
+
+  els.shortcutsList.textContent = "";
+  for (const cmd of commands) {
+    const li = document.createElement("li");
+    const kbd = document.createElement("kbd");
+    kbd.textContent = cmd.shortcut || "unassigned";
+    li.appendChild(kbd);
+    li.appendChild(document.createTextNode(cmd.description || cmd.name));
+    els.shortcutsList.appendChild(li);
+  }
+}
+
 async function buildQueue(selfTabId) {
   const settings = await getSettings();
   const tabs = await browser.tabs.query({});
@@ -176,6 +199,50 @@ async function rebuildAndRender() {
   const selfTab = await browser.tabs.getCurrent();
   await buildQueue(selfTab.id);
   await render();
+}
+
+// Runs instead of buildQueue() when a session is already active (e.g. the
+// decider page was just reloaded, not opened fresh after a browser
+// restart). Leaves cursor, history, and existing queue entries completely
+// untouched -- anything newly opened since the queue was built just gets
+// appended to the end. A tab already sitting in `queue` OR already decided
+// in `history` (most importantly: a Kept tab, which is removed from queue
+// but still open) is never re-added.
+async function mergeNewTabs(selfTabId) {
+  const settings = await getSettings();
+  const { queue, history } = await browser.storage.session.get(["queue", "history"]);
+  const entries = queue || [];
+  const hist = history || [];
+
+  const knownTabIds = new Set(entries.map((e) => e.tabId));
+  for (const h of hist) {
+    if (h.tabId != null) knownTabIds.add(h.tabId);
+  }
+
+  const liveTabs = await browser.tabs.query({});
+  const newEntries = liveTabs
+    .filter((t) => t.id !== selfTabId)
+    .filter((t) => settings.includePinned || !t.pinned)
+    .filter((t) => !knownTabIds.has(t.id))
+    .map((t) => ({
+      tabId: t.id,
+      windowId: t.windowId,
+      url: t.url,
+      title: t.title || t.url,
+      domain: computeDomain(t.url),
+      pinned: !!t.pinned,
+      discarded: !!t.discarded,
+      lastAccessed: t.lastAccessed || 0,
+    }));
+
+  if (newEntries.length === 0) return 0;
+
+  if (settings.sortOrder === "lru") {
+    newEntries.sort((a, b) => a.lastAccessed - b.lastAccessed);
+  }
+
+  await browser.storage.session.set({ queue: [...entries, ...newEntries] });
+  return newEntries.length;
 }
 
 function makeBadge(text, extraClass) {
@@ -460,7 +527,7 @@ async function finalizeDecision(entry, action) {
   const nextQueue = idx === -1 ? entries : entries.filter((e) => e.tabId !== entry.tabId);
   const nextCursor = idx !== -1 && idx < pos ? Math.max(0, pos - 1) : pos;
 
-  const historyEntry = { url: entry.url, title: entry.title, decision: action, decidedAt: Date.now() };
+  const historyEntry = { tabId: entry.tabId, url: entry.url, title: entry.title, decision: action, decidedAt: Date.now() };
 
   await browser.storage.session.set({
     queue: nextQueue,
@@ -597,12 +664,22 @@ async function init() {
   await browser.storage.session.set({ deciderTabId: selfTab.id });
 
   await loadSettingsIntoUI();
+  await renderShortcutsList();
 
   const { sessionActive } = await browser.storage.session.get("sessionActive");
+  let addedCount = 0;
   if (!sessionActive) {
     await buildQueue(selfTab.id);
+  } else {
+    // Reloading the page (not a browser restart) shouldn't lose your
+    // position or rebuild from scratch -- just pick up anything opened
+    // since the queue was last built and tack it onto the end.
+    addedCount = await mergeNewTabs(selfTab.id);
   }
   await render();
+  if (addedCount > 0) {
+    showNotice(`Added ${addedCount} new tab${addedCount === 1 ? "" : "s"} to the end of the queue.`);
+  }
 
   // Keyboard shortcuts are handled in background.js (global commands work
   // regardless of which tab has focus) and relayed here as a message, so

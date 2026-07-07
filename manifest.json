@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tab Decider",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Step through open tabs one at a time: keep (unload) or throw (close).",
   "background": {
     "scripts": ["background.js"]

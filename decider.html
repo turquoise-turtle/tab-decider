@@ -30,6 +30,10 @@
       </select>
     </label>
     <p class="settings-hint">Changing either of these rebuilds the queue from scratch.</p>
+    <div class="settings-shortcuts">
+      <p class="settings-hint">Keyboard shortcuts</p>
+      <ul id="shortcuts-list" class="shortcuts-list"></ul>
+    </div>
   </div>
 
   <div id="position-bar">
@@ -44,44 +48,46 @@
     </div>
   </div>
 
-  <section id="current-card" aria-live="polite">
-    <p class="empty">Loading…</p>
-  </section>
+  <div id="review-area">
+    <section id="current-card" aria-live="polite">
+      <p class="empty">Loading…</p>
+    </section>
 
-  <section id="summary-card" class="summary-card" hidden>
-    <h2>Session complete</h2>
-    <div class="summary-stats">
-      <div class="stat">
-        <span class="stat-value" id="summary-kept">0</span>
-        <span class="stat-label">kept</span>
+    <section id="summary-card" class="summary-card" hidden>
+      <h2>Session complete</h2>
+      <div class="summary-stats">
+        <div class="stat">
+          <span class="stat-value" id="summary-kept">0</span>
+          <span class="stat-label">kept</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="summary-thrown">0</span>
+          <span class="stat-label">thrown</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="summary-duplicates">0</span>
+          <span class="stat-label">duplicates closed</span>
+        </div>
       </div>
-      <div class="stat">
-        <span class="stat-value" id="summary-thrown">0</span>
-        <span class="stat-label">thrown</span>
-      </div>
-      <div class="stat">
-        <span class="stat-value" id="summary-duplicates">0</span>
-        <span class="stat-label">duplicates closed</span>
+      <button id="summary-restart-btn" class="btn-keep">Start a new review</button>
+    </section>
+
+    <div id="duplicate-panel" class="duplicate-panel" hidden>
+      <p id="duplicate-summary" class="duplicate-summary"></p>
+      <ul id="duplicate-list" class="duplicate-list"></ul>
+      <div class="duplicate-actions">
+        <button id="duplicate-close-btn" class="btn-neutral">Close selected</button>
+        <button id="duplicate-throw-all-btn" class="btn-throw" title="Close this tab and every duplicate together">Throw all</button>
       </div>
     </div>
-    <button id="summary-restart-btn" class="btn-keep">Start a new review</button>
-  </section>
 
-  <div id="duplicate-panel" class="duplicate-panel" hidden>
-    <p id="duplicate-summary" class="duplicate-summary"></p>
-    <ul id="duplicate-list" class="duplicate-list"></ul>
-    <div class="duplicate-actions">
-      <button id="duplicate-close-btn" class="btn-neutral">Close selected</button>
-      <button id="duplicate-throw-all-btn" class="btn-throw" title="Close this tab and every duplicate together">Throw all</button>
+    <div id="domain-banner" class="domain-banner" hidden>
+      <span id="domain-banner-text"></span>
+      <button id="domain-bump-btn" class="btn-neutral">Review these next</button>
     </div>
-  </div>
 
-  <div id="domain-banner" class="domain-banner" hidden>
-    <span id="domain-banner-text"></span>
-    <button id="domain-bump-btn" class="btn-neutral">Review these next</button>
+    <div id="notice" class="notice" hidden></div>
   </div>
-
-  <div id="notice" class="notice" hidden></div>
 
   <div id="action-row">
     <button id="peek-btn" class="btn-neutral">Peek</button>
