@@ -5,6 +5,8 @@
 
 > Step through your open tabs one at a time — **keep** (unload) or **throw** (close).
 
+![Screenshot of Addon Page](screenshot.png)
+
 ## Features
 
 - **One tab at a time** — work through your open tabs without overwhelm, sorted oldest-viewed-first by default
