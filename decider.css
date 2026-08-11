@@ -72,6 +72,13 @@ body {
   min-height: 0;
 }
 
+#review-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
 #app-header {
   display: flex;
   align-items: center;
