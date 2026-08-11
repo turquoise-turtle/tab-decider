@@ -348,7 +348,7 @@ function makeBadge(text, extraClass) {
   return span;
 }
 
-function renderCurrentCard(entry, favIconById) {
+function renderCurrentCard(entry, liveTab) {
   els.currentCard.textContent = ""; // clear -- safe, no markup parsing involved
 
   if (!entry) {
@@ -367,7 +367,7 @@ function renderCurrentCard(entry, favIconById) {
   img.alt = "";
   img.width = 20;
   img.height = 20;
-  const favIconUrl = favIconById.get(entry.tabId) || "";
+  const favIconUrl = (liveTab && liveTab.favIconUrl) || "";
   if (favIconUrl) {
     img.addEventListener("error", () => { img.style.visibility = "hidden"; });
     img.src = favIconUrl;
@@ -401,29 +401,42 @@ function renderCurrentCard(entry, favIconById) {
   if (entry.domain) badges.appendChild(makeBadge(entry.domain));
   if (entry.repoKey) badges.appendChild(makeBadge(repoDisplayLabel(entry.repoKey), "badge-repo"));
   if (entry.pinned) badges.appendChild(makeBadge("pinned", "badge-pinned"));
-  if (entry.discarded) badges.appendChild(makeBadge("already unloaded", "badge-discarded"));
+  // Prefer the live value: the stored one is a snapshot from queue-build
+  // time, so a tab discarded by Firefox since then would show stale.
+  const isDiscarded = liveTab ? liveTab.discarded : entry.discarded;
+  if (isDiscarded) badges.appendChild(makeBadge("already unloaded", "badge-discarded"));
   textWrap.appendChild(badges);
 
   card.appendChild(textWrap);
   els.currentCard.appendChild(card);
 }
 
-// Live, non-blocking: recomputed against currently-open tabs on every
-// render of the current entry. Not tied to making a decision at all.
-function renderDuplicates(entry, liveTabs) {
+// Live, non-blocking, and scoped to the PENDING QUEUE rather than every
+// open tab. That scoping is deliberate: a tab that's been Kept is removed
+// from the queue but stays open (just discarded from memory), and offering
+// to close it later would undo a decision the user explicitly made. Same
+// protection falls out for anything else deliberately excluded from review
+// -- pinned tabs when includePinned is off, and the decider tab itself.
+//
+// Tradeoff worth knowing: entries hold the URL captured when the queue was
+// built, so a tab that navigates afterwards is matched on its old URL.
+// closeDuplicates/throwAllDuplicates re-verify against the live tab before
+// actually closing anything, so a stale match can't cause a wrong close --
+// it can only cause a stale row to appear here briefly.
+function renderDuplicates(entry, entries) {
   if (!entry) {
     els.duplicatePanel.hidden = true;
     currentDuplicateMatches = [];
     return;
   }
 
-  const matches = liveTabs
-    .filter((t) => t.url === entry.url && t.id !== entry.tabId)
-    .map((t) => ({
-      tabId: t.id,
-      url: t.url,
-      title: t.title || t.url,
-      sameWindow: t.windowId === entry.windowId,
+  const matches = entries
+    .filter((e) => e.url === entry.url && e.tabId !== entry.tabId)
+    .map((e) => ({
+      tabId: e.tabId,
+      url: e.url,
+      title: e.title,
+      sameWindow: e.windowId === entry.windowId,
       checked: true,
     }));
 
@@ -565,11 +578,22 @@ async function render() {
   els.jumpInput.value = "";
 
   const entry = entries[pos];
-  const liveTabs = await browser.tabs.query({});
-  const favIconById = new Map(liveTabs.map((t) => [t.id, t.favIconUrl || ""]));
 
-  renderCurrentCard(entry, favIconById);
-  renderDuplicates(entry, liveTabs);
+  // One tabs.get() for the current entry, instead of the tabs.query({})
+  // this used to run on every single render -- that pulled every open tab
+  // (~1,900 in real use) and built a favicon Map of all of them just to
+  // read one entry's icon. Duplicates no longer need the full list either,
+  // since they're matched against the queue now.
+  let liveTab = null;
+  try {
+    liveTab = await browser.tabs.get(entry.tabId);
+  } catch {
+    // Tab's gone; background.js's onRemoved listener will prune it from the
+    // queue. Render what we have from the stored entry rather than blanking.
+  }
+
+  renderCurrentCard(entry, liveTab);
+  renderDuplicates(entry, entries);
   renderSiblingBanners(entry, entries);
 
   els.peekBtn.disabled = false;
@@ -822,17 +846,33 @@ async function finalizeDecision(entry, action) {
   await render();
 }
 
+// Queue entries hold the URL captured when the queue was built, so a tab
+// that navigated since then could be matched as a duplicate on a URL it no
+// longer has. Closing is destructive, so confirm against the live tab first
+// -- a stale match then costs nothing worse than a skipped row.
+async function closeTabIfStillMatching(tabId, expectedUrl) {
+  try {
+    const live = await browser.tabs.get(tabId);
+    if (live.url !== expectedUrl) {
+      console.warn("Tab Decider: skipping close, tab no longer matches", { tabId, expectedUrl, actual: live.url });
+      return false;
+    }
+    await browser.tabs.remove(tabId);
+    return true;
+  } catch (err) {
+    console.warn("Tab Decider: close failed", err);
+    return false;
+  }
+}
+
 async function closeDuplicates() {
   const toClose = currentDuplicateMatches.filter((m) => m.checked);
   if (toClose.length === 0) return;
 
   const closedItems = [];
   for (const m of toClose) {
-    try {
-      await browser.tabs.remove(m.tabId);
+    if (await closeTabIfStillMatching(m.tabId, m.url)) {
       closedItems.push({ url: m.url, title: m.title, wasCurrent: false });
-    } catch (err) {
-      console.warn("Tab Decider: duplicate close failed", err);
     }
   }
 
@@ -869,12 +909,9 @@ async function throwAllDuplicates() {
   }
   let duplicatesClosedCount = 0;
   for (const m of matches) {
-    try {
-      await browser.tabs.remove(m.tabId);
+    if (await closeTabIfStillMatching(m.tabId, m.url)) {
       closedItems.push({ url: m.url, title: m.title, wasCurrent: false });
       duplicatesClosedCount++;
-    } catch (err) {
-      console.warn("Tab Decider: throw-all failed on a duplicate", err);
     }
   }
 
