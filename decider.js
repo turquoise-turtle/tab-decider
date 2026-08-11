@@ -53,6 +53,8 @@ const els = {
   stepFwd10: document.getElementById("step-fwd-10"),
   currentCard: document.getElementById("current-card"),
   notice: document.getElementById("notice"),
+  noticeText: document.getElementById("notice-text"),
+  noticeUndoBtn: document.getElementById("notice-undo-btn"),
   resetBtn: document.getElementById("reset-btn"),
   actionRow: document.getElementById("action-row"),
   peekBtn: document.getElementById("peek-btn"),
@@ -77,14 +79,16 @@ const els = {
 // "Close selected" button know which checkboxes are currently ticked.
 let currentDuplicateMatches = [];
 
-function showNotice(message) {
-  els.notice.textContent = message;
+function showNotice(message, undoAvailable = false) {
+  els.noticeText.textContent = message;
   els.notice.hidden = false;
+  els.noticeUndoBtn.hidden = !undoAvailable;
 }
 
 function clearNotice() {
   els.notice.hidden = true;
-  els.notice.textContent = "";
+  els.noticeText.textContent = "";
+  els.noticeUndoBtn.hidden = true;
 }
 
 function computeDomain(url) {
@@ -322,6 +326,7 @@ function renderDuplicates(entry, liveTabs) {
     .filter((t) => t.url === entry.url && t.id !== entry.tabId)
     .map((t) => ({
       tabId: t.id,
+      url: t.url,
       title: t.title || t.url,
       sameWindow: t.windowId === entry.windowId,
       checked: true,
@@ -404,8 +409,12 @@ async function render() {
     els.duplicatePanel.hidden = true;
     els.domainBanner.hidden = true;
     els.actionRow.hidden = true;
+    const enteringSummary = els.summaryCard.hidden;
     els.summaryCard.hidden = false;
     renderSummary(history || [], dupCount);
+    if (enteringSummary) {
+      els.summaryRestartBtn.focus();
+    }
 
     els.peekBtn.disabled = true;
     els.keepBtn.disabled = true;
@@ -475,6 +484,108 @@ async function ensureNotActiveInWindow(tabId, windowId) {
   return true;
 }
 
+// sessions.getRecentlyClosed can lag a beat behind the actual tabs.remove()
+// call, so poll briefly rather than assuming it's there on the first check.
+async function findRecentlyClosedSessionId(url) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const sessions = await browser.sessions.getRecentlyClosed({ maxResults: 10 });
+      const match = sessions.find((s) => s.tab && s.tab.url === url);
+      if (match) return match.tab.sessionId;
+    } catch (err) {
+      console.warn("Tab Decider: couldn't read recently-closed sessions", err);
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return null;
+}
+
+// Called right after any tab-closing action. `closedItems` is what was just
+// closed (each flagged `wasCurrent` if it was the entry actually being
+// decided, vs. a duplicate closed alongside it). `historyEntriesToRemove`
+// and `duplicatesToUncount` let undo roll back the session-stats bookkeeping
+// too, not just reopen the tabs.
+async function captureClosedForUndo(closedItems, historyEntriesToRemove, duplicatesToUncount) {
+  const items = [];
+  for (const closed of closedItems) {
+    const sessionId = await findRecentlyClosedSessionId(closed.url);
+    if (sessionId) {
+      items.push({ sessionId, url: closed.url, title: closed.title, wasCurrent: closed.wasCurrent });
+    }
+  }
+  if (items.length === 0) return;
+  await browser.storage.session.set({
+    lastClosedAction: { items, historyEntriesToRemove, duplicatesToUncount, closedAt: Date.now() },
+  });
+}
+
+// Restores every tab from the last closing action via the real
+// sessions.restore() API -- an actually-reopened tab, not a queue-only
+// simulation. The item that was the entry actually being decided (if any)
+// goes back to exactly where the cursor is now; anything else closed
+// alongside it (duplicates) gets appended to the end, same as any other
+// newly-appeared tab. Also rolls back the history/duplicate-count
+// bookkeeping so the session summary stays accurate.
+async function undoLastClose() {
+  const { lastClosedAction, queue, cursor, history, duplicatesClosedTotal } = await browser.storage.session.get([
+    "lastClosedAction", "queue", "cursor", "history", "duplicatesClosedTotal",
+  ]);
+  if (!lastClosedAction) return;
+
+  const restoredCurrent = [];
+  const restoredOthers = [];
+
+  for (const item of lastClosedAction.items) {
+    try {
+      const result = await browser.sessions.restore(item.sessionId);
+      const restoredTab = result && result.tab;
+      if (!restoredTab) continue;
+      const restoredEntry = {
+        tabId: restoredTab.id,
+        windowId: restoredTab.windowId,
+        url: restoredTab.url,
+        title: restoredTab.title || restoredTab.url,
+        domain: computeDomain(restoredTab.url),
+        pinned: !!restoredTab.pinned,
+        discarded: !!restoredTab.discarded,
+        lastAccessed: restoredTab.lastAccessed || Date.now(),
+      };
+      (item.wasCurrent ? restoredCurrent : restoredOthers).push(restoredEntry);
+    } catch (err) {
+      console.warn("Tab Decider: couldn't restore a tab", err);
+    }
+  }
+
+  const totalRestored = restoredCurrent.length + restoredOthers.length;
+  if (totalRestored === 0) {
+    await browser.storage.session.set({ lastClosedAction: null });
+    showNotice("Couldn't undo -- Firefox may have already cleared that from its closed-tabs history.");
+    return;
+  }
+
+  const entries = queue || [];
+  const pos = cursor || 0;
+  const nextQueue = [...entries.slice(0, pos), ...restoredCurrent, ...entries.slice(pos), ...restoredOthers];
+
+  const hist = (history || []).slice();
+  for (let i = 0; i < lastClosedAction.historyEntriesToRemove && hist.length; i++) {
+    hist.pop();
+  }
+  const nextDupTotal = Math.max(0, (duplicatesClosedTotal || 0) - lastClosedAction.duplicatesToUncount);
+
+  await browser.storage.session.set({
+    queue: nextQueue,
+    cursor: pos,
+    history: hist,
+    duplicatesClosedTotal: nextDupTotal,
+    lastClosedAction: null,
+  });
+
+  await render();
+  showNotice(`Restored ${totalRestored} tab${totalRestored === 1 ? "" : "s"}.`);
+}
+
 async function decide(action) {
   const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
   const entries = queue || [];
@@ -512,6 +623,11 @@ async function decide(action) {
   }
 
   await finalizeDecision(entry, action);
+
+  if (action === "throw") {
+    await captureClosedForUndo([{ url: entry.url, title: entry.title, wasCurrent: true }], 1, 0);
+    showNotice(`Threw "${entry.title}".`, true);
+  }
 }
 
 // Re-reads storage right before writing (rather than trusting the entry
@@ -541,9 +657,11 @@ async function closeDuplicates() {
   const toClose = currentDuplicateMatches.filter((m) => m.checked);
   if (toClose.length === 0) return;
 
+  const closedItems = [];
   for (const m of toClose) {
     try {
       await browser.tabs.remove(m.tabId);
+      closedItems.push({ url: m.url, title: m.title, wasCurrent: false });
     } catch (err) {
       console.warn("Tab Decider: duplicate close failed", err);
     }
@@ -553,7 +671,8 @@ async function closeDuplicates() {
   await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + toClose.length });
 
   await render();
-  showNotice(`Closed ${toClose.length} duplicate tab${toClose.length === 1 ? "" : "s"}.`);
+  await captureClosedForUndo(closedItems, 0, closedItems.length);
+  showNotice(`Closed ${toClose.length} duplicate tab${toClose.length === 1 ? "" : "s"}.`, true);
 }
 
 // Closes the current entry AND every duplicate match together, regardless
@@ -569,25 +688,34 @@ async function throwAllDuplicates() {
   if (!entry) return;
 
   const matches = currentDuplicateMatches.slice();
+  const closedItems = [];
 
   try {
     await browser.tabs.remove(entry.tabId);
+    closedItems.push({ url: entry.url, title: entry.title, wasCurrent: true });
   } catch (err) {
     console.warn("Tab Decider: throw-all failed on current tab", err);
   }
+  let duplicatesClosedCount = 0;
   for (const m of matches) {
     try {
       await browser.tabs.remove(m.tabId);
+      closedItems.push({ url: m.url, title: m.title, wasCurrent: false });
+      duplicatesClosedCount++;
     } catch (err) {
       console.warn("Tab Decider: throw-all failed on a duplicate", err);
     }
   }
 
   const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
-  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + matches.length });
+  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + duplicatesClosedCount });
 
   await finalizeDecision(entry, "throw");
-  showNotice(`Threw ${matches.length + 1} tabs -- this one plus ${matches.length} duplicate${matches.length === 1 ? "" : "s"}.`);
+  await captureClosedForUndo(closedItems, 1, duplicatesClosedCount);
+  showNotice(
+    `Threw ${closedItems.length} tabs -- this one plus ${duplicatesClosedCount} duplicate${duplicatesClosedCount === 1 ? "" : "s"}.`,
+    true
+  );
 }
 
 // Moves every other pending entry sharing the current tab's domain to
@@ -695,6 +823,7 @@ async function init() {
 
   els.resetBtn.addEventListener("click", rebuildAndRender);
   els.summaryRestartBtn.addEventListener("click", rebuildAndRender);
+  els.noticeUndoBtn.addEventListener("click", undoLastClose);
 
   els.settingsToggleBtn.addEventListener("click", () => {
     const isHidden = els.settingsPanel.hidden;

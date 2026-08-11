@@ -243,6 +243,7 @@ select:focus-visible {
   border-radius: 999px;
   background: var(--badge-bg);
   color: var(--text-muted);
+  border: 1px solid transparent;
 }
 .badge-pinned { background: var(--badge-pinned-bg); color: var(--badge-pinned-text); }
 .badge-discarded { background: var(--badge-discarded-bg); color: var(--accent); }
@@ -255,8 +256,13 @@ select:focus-visible {
   padding: 10px 14px;
   margin-bottom: 16px;
   font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 .notice[hidden] { display: none; }
+.notice button { flex-shrink: 0; padding: 4px 12px; font-size: 12px; }
 
 .duplicate-panel {
   background: var(--surface);
@@ -342,3 +348,7 @@ select:focus-visible {
   color: #ffffff;
 }
 .btn-throw:hover:not(:disabled) { filter: brightness(0.92); }
+
+@media (forced-colors: active) {
+  .badge { border-color: CanvasText; }
+}

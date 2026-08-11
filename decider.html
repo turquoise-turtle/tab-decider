@@ -36,15 +36,16 @@
     </div>
   </div>
 
+  <main id="review-main">
   <div id="position-bar">
     <span id="position-label">—</span>
     <div id="position-controls">
-      <button id="step-back-10" class="btn-neutral" title="Back 10">-10</button>
-      <button id="step-back-1" class="btn-neutral" title="Back 1">-1</button>
-      <input id="jump-input" type="number" min="1" placeholder="#" title="Jump to position" />
+      <button id="step-back-10" class="btn-neutral" title="Back 10" aria-label="Back 10 tabs">-10</button>
+      <button id="step-back-1" class="btn-neutral" title="Back 1" aria-label="Back 1 tab">-1</button>
+      <input id="jump-input" type="number" min="1" placeholder="#" title="Jump to position" aria-label="Jump to position" />
       <button id="jump-btn" class="btn-neutral">Go</button>
-      <button id="step-fwd-1" class="btn-neutral" title="Skip 1">+1</button>
-      <button id="step-fwd-10" class="btn-neutral" title="Skip 10">+10</button>
+      <button id="step-fwd-1" class="btn-neutral" title="Skip 1" aria-label="Skip 1 tab">+1</button>
+      <button id="step-fwd-10" class="btn-neutral" title="Skip 10" aria-label="Skip 10 tabs">+10</button>
     </div>
   </div>
 
@@ -69,31 +70,35 @@
           <span class="stat-label">duplicates closed</span>
         </div>
       </div>
-      <button id="summary-restart-btn" class="btn-keep">Start a new review</button>
+      <button id="summary-restart-btn" class="btn-keep" title="Rebuild the queue from every currently open tab">Start a new review</button>
     </section>
 
     <div id="duplicate-panel" class="duplicate-panel" hidden>
       <p id="duplicate-summary" class="duplicate-summary"></p>
       <ul id="duplicate-list" class="duplicate-list"></ul>
       <div class="duplicate-actions">
-        <button id="duplicate-close-btn" class="btn-neutral">Close selected</button>
+        <button id="duplicate-close-btn" class="btn-neutral" title="Close only the checked tabs below; this tab's own decision is separate">Close selected</button>
         <button id="duplicate-throw-all-btn" class="btn-throw" title="Close this tab and every duplicate together">Throw all</button>
       </div>
     </div>
 
     <div id="domain-banner" class="domain-banner" hidden>
       <span id="domain-banner-text"></span>
-      <button id="domain-bump-btn" class="btn-neutral">Review these next</button>
+      <button id="domain-bump-btn" class="btn-neutral" title="Move these tabs to right after this one in the queue">Review these next</button>
     </div>
 
-    <div id="notice" class="notice" hidden></div>
+    <div id="notice" class="notice" hidden role="status" aria-live="polite">
+      <span id="notice-text"></span>
+      <button id="notice-undo-btn" class="btn-neutral" hidden>Undo</button>
+    </div>
   </div>
 
   <div id="action-row">
-    <button id="peek-btn" class="btn-neutral">Peek</button>
-    <button id="keep-btn" class="btn-keep">Keep</button>
-    <button id="throw-btn" class="btn-throw">Throw</button>
+    <button id="peek-btn" class="btn-neutral" title="Switch to this tab for a closer look, then come back here">Peek</button>
+    <button id="keep-btn" class="btn-keep" title="Unload from memory -- stays open, just not using RAM">Keep</button>
+    <button id="throw-btn" class="btn-throw" title="Close this tab">Throw</button>
   </div>
+  </main>
 </div>
 <script src="decider.js"></script>
 </body>
