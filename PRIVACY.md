@@ -2,26 +2,26 @@
 
 **Tab Decider** does not collect, transmit, or store any personal data.
 
-The extension reads your open tabs' metadata (URL, title, last accessed time,
-pinned and discarded state) solely to build and display the review queue. This
-information never leaves your device — it is not sent to any server, not shared
-with any third party, and not written to any external storage.
+## What it reads
 
-The extension uses two types of browser storage, both local to your device:
+To build and display the review queue, the extension reads metadata about your
+open tabs: URL, title, favicon, last accessed time, and pinned and discarded
+state.
 
-- `browser.storage.session` holds the active review queue, cursor position, and
-  session history. This data is automatically wiped when the browser fully
-  restarts — by design.
-- `browser.storage.local` holds your preferences (tab sort order, pinned tab
-  inclusion). This data is never read by anyone other than the extension itself,
-  and it is removed when you uninstall the extension.
+To support the undo feature, it also reads Firefox's list of recently closed
+tabs, so a tab you close by mistake can be reopened. This list is provided by
+Firefox itself and is only read when undo is used.
 
-The extension does not use analytics, crash reporting, advertising, or any form
-of remote logging.
+## What it stores
 
-**In short:** your data stays on your device. The extension has no back-end and
-no internet connection.
+Both storage areas are local to your device.
+
+- `browser.storage.session` holds the active review queue, your position in it,
+  and this session's decisions. Firefox wipes this automatically when the browser
+  restarts, which is intentional.
+- `browser.storage.local` holds your two preferences: sort order and whether
+  pinned tabs are included. This is removed when you uninstall the extension.
 
 ---
 
-*Last updated: July 2026*
+*Last updated: August 2026*
