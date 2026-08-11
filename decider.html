@@ -11,13 +11,13 @@
   <header id="app-header">
     <h1>Tab Decider</h1>
     <div id="progress">Loading…</div>
-    <button id="settings-toggle-btn" class="btn-neutral" title="Settings" aria-expanded="false">Settings</button>
+    <button id="settings-toggle-btn" class="btn-neutral" title="Settings" aria-expanded="false" aria-controls="settings-panel">Settings</button>
     <button id="reset-btn" title="Clear all decisions and rebuild the queue from every open tab">
       Forget decisions
     </button>
   </header>
 
-  <div id="settings-panel" class="settings-panel" hidden>
+  <div id="settings-panel" class="settings-panel" hidden role="region" aria-label="Settings">
     <label class="settings-row">
       <input type="checkbox" id="setting-include-pinned" />
       Include pinned tabs
@@ -50,6 +50,11 @@
   </div>
 
   <main id="review-main">
+  <!-- Single narrow announcement channel. Replaces aria-live on the whole
+       card, which made screen readers re-read title + URL + timestamp + every
+       badge on every step -- punishing at ~1,900 tabs. -->
+  <p id="announcer" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+
   <div id="filter-bar">
     <input id="filter-input" type="search" placeholder="Filter by title or URL…" aria-label="Filter queue by title or URL" />
     <button id="filter-clear-btn" class="btn-neutral" title="Clear the filter and return to the full queue" hidden>Clear</button>
@@ -58,18 +63,18 @@
 
   <div id="position-bar">
     <span id="position-label">—</span>
-    <div id="position-controls">
+    <div id="position-controls" role="group" aria-label="Queue navigation">
       <button id="step-back-10" class="btn-neutral" title="Back 10" aria-label="Back 10 tabs">-10</button>
       <button id="step-back-1" class="btn-neutral" title="Back 1" aria-label="Back 1 tab">-1</button>
       <input id="jump-input" type="number" min="1" placeholder="#" title="Jump to position" aria-label="Jump to position" />
-      <button id="jump-btn" class="btn-neutral">Go</button>
+      <button id="jump-btn" class="btn-neutral" aria-label="Jump to entered position">Go</button>
       <button id="step-fwd-1" class="btn-neutral" title="Skip 1" aria-label="Skip 1 tab">+1</button>
       <button id="step-fwd-10" class="btn-neutral" title="Skip 10" aria-label="Skip 10 tabs">+10</button>
     </div>
   </div>
 
   <div id="review-area">
-    <section id="current-card" aria-live="polite">
+    <section id="current-card" aria-label="Current tab under review">
       <p class="empty">Loading…</p>
     </section>
 
@@ -92,7 +97,7 @@
       <button id="summary-restart-btn" class="btn-keep" title="Rebuild the queue from every currently open tab">Start a new review</button>
     </section>
 
-    <div id="duplicate-panel" class="duplicate-panel" hidden>
+    <div id="duplicate-panel" class="duplicate-panel" hidden role="region" aria-label="Duplicate tabs">
       <p id="duplicate-summary" class="duplicate-summary"></p>
       <ul id="duplicate-list" class="duplicate-list"></ul>
       <div class="duplicate-actions">

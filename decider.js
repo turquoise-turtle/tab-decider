@@ -44,6 +44,8 @@ const els = {
   settingIncludePinned: document.getElementById("setting-include-pinned"),
   settingSortOrder: document.getElementById("setting-sort-order"),
   shortcutsList: document.getElementById("shortcuts-list"),
+  reviewMain: document.getElementById("review-main"),
+  announcer: document.getElementById("announcer"),
   filterInput: document.getElementById("filter-input"),
   filterClearBtn: document.getElementById("filter-clear-btn"),
   filterStatus: document.getElementById("filter-status"),
@@ -84,6 +86,49 @@ const els = {
 // Transient, recomputed on every render -- not persisted. Just lets the
 // "Close selected" button know which checkboxes are currently ticked.
 let currentDuplicateMatches = [];
+
+// Every action that mutates tabs or queue state goes through runExclusive.
+// Nothing previously stopped two of them overlapping: a double-click, a held
+// key repeating, or a global shortcut firing twice could both read the same
+// cursor snapshot before either wrote, so two decisions would act on one tab
+// (or one decision would be silently lost).
+const DECISION_ACTIONS = new Set(["keep", "throw"]);
+
+let actionInProgress = false;
+
+async function runExclusive(operation) {
+  if (actionInProgress) return;
+  actionInProgress = true;
+  setBusy(true);
+  try {
+    return await operation();
+  } catch (err) {
+    console.error("Tab Decider: action failed", err);
+    showNotice("Something went wrong with that action -- see the console for details.");
+  } finally {
+    actionInProgress = false;
+    setBusy(false);
+  }
+}
+
+// Only sets aria-busy. Deliberately does NOT disable the buttons: re-enabling
+// them afterwards would fight render()'s own disabled-state logic, and an
+// operation that returns early (e.g. decide() bailing on an undiscardable
+// tab) would leave them stuck disabled. The actionInProgress flag already
+// prevents re-entry on its own.
+function setBusy(busy) {
+  els.reviewMain.setAttribute("aria-busy", String(busy));
+}
+
+// The single screen-reader announcement channel. One concise sentence per
+// state change beats the old approach of marking the whole card aria-live,
+// which re-read title + URL + relative time + every badge on every step.
+function announce(message) {
+  // Reassigning identical text does not re-fire a live region; clearing first
+  // guarantees repeated states (e.g. two identical titles) still announce.
+  els.announcer.textContent = "";
+  els.announcer.textContent = message;
+}
 
 function showNotice(message, undoAvailable = false) {
   els.noticeText.textContent = message;
@@ -596,7 +641,12 @@ async function render() {
     const enteringSummary = els.summaryCard.hidden;
     els.summaryCard.hidden = false;
     renderSummary(history || [], dupCount);
-    if (enteringSummary) els.summaryRestartBtn.focus();
+    if (enteringSummary) {
+      els.summaryRestartBtn.focus();
+      const kept = (history || []).filter((h) => h.decision === "keep").length;
+      const thrown = (history || []).filter((h) => h.decision === "throw").length;
+      announce(`Review complete. ${kept} kept, ${thrown} thrown.`);
+    }
     return;
   }
 
@@ -612,6 +662,7 @@ async function render() {
     p.className = "empty";
     p.textContent = `Nothing in the queue matches \u201c${view.query}\u201d.`;
     els.currentCard.appendChild(p);
+    announce(`No tabs match ${view.query}.`);
     els.duplicatePanel.hidden = true;
     els.domainBanner.hidden = true;
     els.repoBanner.hidden = true;
@@ -653,6 +704,17 @@ async function render() {
   // of a filter is still a duplicate, and hiding it would be misleading.
   renderDuplicates(entry, entries);
   renderSiblingBanners(entry, entries);
+
+  // One sentence covering position, identity, and whatever contextual panels
+  // just appeared -- those panels are otherwise silent to screen readers,
+  // and "Throw all" in the duplicate panel is destructive.
+  const parts = [`Tab ${view.viewPos + 1} of ${view.viewSize}${view.query ? " matching" : ""}: ${entry.title}`];
+  if (currentDuplicateMatches.length > 0) {
+    parts.push(`${currentDuplicateMatches.length} duplicate${currentDuplicateMatches.length === 1 ? "" : "s"} of this URL open`);
+  }
+  if (!els.repoBanner.hidden) parts.push(els.repoBannerText.textContent);
+  else if (!els.domainBanner.hidden) parts.push(els.domainBannerText.textContent);
+  announce(parts.join(". "));
 }
 
 // Firefox refuses to discard a window's *active* tab (the promise just
@@ -830,6 +892,14 @@ async function undoLastClose() {
 }
 
 async function decide(action) {
+  // Belt and braces: the message listener already whitelists this, but an
+  // internal caller could still get it wrong, and silently mis-finalising a
+  // decision is the worst possible failure mode here.
+  if (!DECISION_ACTIONS.has(action)) {
+    console.error("Tab Decider: refusing unsupported decision action", action);
+    return;
+  }
+
   const view = await getView();
   const entry = view.entry;
   if (!entry) return;
@@ -1198,22 +1268,22 @@ function onPageKeydown(e) {
       e.preventDefault();
       break;
     case "Enter":
-      if (!els.keepBtn.disabled) decide("keep");
+      if (!els.keepBtn.disabled) runExclusive(() => decide("keep"));
       e.preventDefault();
       break;
     case "x":
     case "X":
-      if (!els.throwBtn.disabled) decide("throw");
+      if (!els.throwBtn.disabled) runExclusive(() => decide("throw"));
       e.preventDefault();
       break;
     case "p":
     case "P":
-      if (!els.peekBtn.disabled) peekCurrent();
+      if (!els.peekBtn.disabled) runExclusive(peekCurrent);
       e.preventDefault();
       break;
     case "u":
     case "U":
-      if (!els.noticeUndoBtn.hidden) undoLastClose();
+      if (!els.noticeUndoBtn.hidden) runExclusive(undoLastClose);
       e.preventDefault();
       break;
     case "ArrowRight":
@@ -1258,33 +1328,52 @@ async function init() {
   // decide() promise lets background.js's sendMessage() await full
   // completion (decision + duplicate/domain re-render) before it brings
   // this tab into focus.
-  browser.runtime.onMessage.addListener((message) => {
-    if (!message || message.type !== "decide") return;
-    return decide(message.action);
+  // runtime.onMessage is a trust boundary even with no content scripts and
+  // nothing externally connectable. Without the action whitelist, a message
+  // like {type:"decide", action:"anything"} fell straight through decide()'s
+  // keep/throw branches into finalizeDecision() -- silently dropping the
+  // entry from the queue and writing a bogus history record WITHOUT ever
+  // discarding or closing the tab.
+  browser.runtime.onMessage.addListener((message, sender) => {
+    if (!sender || sender.id !== browser.runtime.id) return;
+    if (!message || typeof message !== "object") return;
+    if (message.type !== "decide") return;
+    if (!DECISION_ACTIONS.has(message.action)) {
+      console.warn("Tab Decider: ignoring unsupported decision action", message.action);
+      return;
+    }
+    return runExclusive(() => decide(message.action));
   });
 
-  els.resetBtn.addEventListener("click", handleResetClick);
+  els.resetBtn.addEventListener("click", () => runExclusive(handleResetClick));
   // No confirm needed here: the summary only appears once the queue is
   // already empty, so there's no in-progress review left to lose.
-  els.summaryRestartBtn.addEventListener("click", rebuildAndRender);
-  els.noticeUndoBtn.addEventListener("click", undoLastClose);
+  els.summaryRestartBtn.addEventListener("click", () => runExclusive(rebuildAndRender));
+  els.noticeUndoBtn.addEventListener("click", () => runExclusive(undoLastClose));
 
   els.settingsToggleBtn.addEventListener("click", () => {
-    const isHidden = els.settingsPanel.hidden;
-    els.settingsPanel.hidden = !isHidden;
-    els.settingsToggleBtn.setAttribute("aria-expanded", String(isHidden));
+    const opening = els.settingsPanel.hidden;
+    els.settingsPanel.hidden = !opening;
+    els.settingsToggleBtn.setAttribute("aria-expanded", String(opening));
+    if (opening) {
+      els.settingIncludePinned.focus();
+    } else {
+      // Focus would otherwise be left on a now-hidden control and fall back
+      // to document.body, stranding keyboard users.
+      els.settingsToggleBtn.focus();
+    }
   });
   els.settingIncludePinned.addEventListener("change", saveSettingsFromUI);
   els.settingSortOrder.addEventListener("change", saveSettingsFromUI);
 
-  els.peekBtn.addEventListener("click", peekCurrent);
-  els.keepBtn.addEventListener("click", () => decide("keep"));
-  els.throwBtn.addEventListener("click", () => decide("throw"));
+  els.peekBtn.addEventListener("click", () => runExclusive(peekCurrent));
+  els.keepBtn.addEventListener("click", () => runExclusive(() => decide("keep")));
+  els.throwBtn.addEventListener("click", () => runExclusive(() => decide("throw")));
 
-  els.duplicateCloseBtn.addEventListener("click", closeDuplicates);
-  els.duplicateThrowAllBtn.addEventListener("click", throwAllDuplicates);
-  els.domainBumpBtn.addEventListener("click", bumpDomainSiblings);
-  els.repoBumpBtn.addEventListener("click", bumpRepoSiblings);
+  els.duplicateCloseBtn.addEventListener("click", () => runExclusive(closeDuplicates));
+  els.duplicateThrowAllBtn.addEventListener("click", () => runExclusive(throwAllDuplicates));
+  els.domainBumpBtn.addEventListener("click", () => runExclusive(bumpDomainSiblings));
+  els.repoBumpBtn.addEventListener("click", () => runExclusive(bumpRepoSiblings));
 
   els.stepBack10.addEventListener("click", () => stepCursor(-10));
   els.stepBack1.addEventListener("click", () => stepCursor(-1));
