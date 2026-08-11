@@ -541,12 +541,19 @@ async function undoLastClose() {
       const result = await browser.sessions.restore(item.sessionId);
       const restoredTab = result && result.tab;
       if (!restoredTab) continue;
+      // Deliberately NOT reading restoredTab.url/title here: right at the
+      // moment this promise resolves, Firefox has the tab's title populated
+      // from the session data but the URL can still be mid-navigation and
+      // read as "about:blank" -- a real, reproducible race, not a rare
+      // edge case. item.url/item.title were captured before the tab was
+      // ever closed, so they're already ground truth -- no need to trust
+      // (or poll around) the freshly-restored tab for those two fields.
       const restoredEntry = {
         tabId: restoredTab.id,
         windowId: restoredTab.windowId,
-        url: restoredTab.url,
-        title: restoredTab.title || restoredTab.url,
-        domain: computeDomain(restoredTab.url),
+        url: item.url,
+        title: item.title,
+        domain: computeDomain(item.url),
         pinned: !!restoredTab.pinned,
         discarded: !!restoredTab.discarded,
         lastAccessed: restoredTab.lastAccessed || Date.now(),
