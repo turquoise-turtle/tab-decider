@@ -254,6 +254,7 @@ select:focus-visible {
 }
 .badge-pinned { background: var(--badge-pinned-bg); color: var(--badge-pinned-text); }
 .badge-discarded { background: var(--badge-discarded-bg); color: var(--accent); }
+.badge-repo { background: var(--domain-bg); color: var(--domain-text); }
 
 .notice {
   background: var(--notice-bg);

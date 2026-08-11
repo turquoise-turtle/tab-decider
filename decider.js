@@ -68,6 +68,9 @@ const els = {
   domainBanner: document.getElementById("domain-banner"),
   domainBannerText: document.getElementById("domain-banner-text"),
   domainBumpBtn: document.getElementById("domain-bump-btn"),
+  repoBanner: document.getElementById("repo-banner"),
+  repoBannerText: document.getElementById("repo-banner-text"),
+  repoBumpBtn: document.getElementById("repo-bump-btn"),
   summaryCard: document.getElementById("summary-card"),
   summaryKept: document.getElementById("summary-kept"),
   summaryThrown: document.getElementById("summary-thrown"),
@@ -99,6 +102,47 @@ function computeDomain(url) {
   } catch {
     return null; // about:, file:, moz-extension:, etc. -- no meaningful domain
   }
+}
+
+const GIT_HOSTS = new Set(["github.com", "gitlab.com", "codeberg.org"]);
+
+// A handful of top-level path segments that look like a username/org but
+// aren't, shared across GitHub/GitLab/Codeberg's URL conventions. Not
+// exhaustive -- a real false-positive-free version would need to check
+// against each host's actual reserved-word list -- but it covers the
+// common cases cheaply.
+const GIT_HOST_RESERVED_OWNERS = new Set([
+  "settings", "notifications", "marketplace", "explore", "sponsors",
+  "topics", "trending", "orgs", "about", "pricing", "features",
+  "login", "signup", "join", "dashboard", "issues", "pulls", "search",
+  "new", "codespaces", "gists", "gist", "-", "stars",
+]);
+
+// Only ever groups at the owner+repo level -- e.g. "github.com/facebook/react"
+// -- never at just "github.com/facebook", since a user/org page isn't a
+// meaningful review-together unit the way a single repo's tabs are.
+function computeRepoKey(url, domain) {
+  if (!domain || !GIT_HOSTS.has(domain)) return null;
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (parts.length < 2) return null; // just the host root or a lone user/org page
+    const [owner, repo] = parts;
+    if (!owner || !repo) return null;
+    if (GIT_HOST_RESERVED_OWNERS.has(owner.toLowerCase())) return null;
+    return `${domain}/${owner}/${repo}`;
+  } catch {
+    return null;
+  }
+}
+
+// "github.com/facebook/react" -> "facebook/react", for display only. The
+// full key (including host) is still what's used for actual matching, so a
+// GitHub and a GitLab repo that happen to share an owner/repo name never
+// collide.
+function repoDisplayLabel(repoKey) {
+  const idx = repoKey.indexOf("/");
+  return idx === -1 ? repoKey : repoKey.slice(idx + 1);
 }
 
 function formatRelativeTime(ms) {
@@ -168,16 +212,20 @@ async function buildQueue(selfTabId) {
   const entries = tabs
     .filter((t) => t.id !== selfTabId)
     .filter((t) => settings.includePinned || !t.pinned)
-    .map((t) => ({
-      tabId: t.id,
-      windowId: t.windowId,
-      url: t.url,
-      title: t.title || t.url,
-      domain: computeDomain(t.url),
-      pinned: !!t.pinned,
-      discarded: !!t.discarded,
-      lastAccessed: t.lastAccessed || 0,
-    }));
+    .map((t) => {
+      const domain = computeDomain(t.url);
+      return {
+        tabId: t.id,
+        windowId: t.windowId,
+        url: t.url,
+        title: t.title || t.url,
+        domain,
+        repoKey: computeRepoKey(t.url, domain),
+        pinned: !!t.pinned,
+        discarded: !!t.discarded,
+        lastAccessed: t.lastAccessed || 0,
+      };
+    });
 
   if (settings.sortOrder === "lru") {
     entries.sort((a, b) => a.lastAccessed - b.lastAccessed);
@@ -228,16 +276,20 @@ async function mergeNewTabs(selfTabId) {
     .filter((t) => t.id !== selfTabId)
     .filter((t) => settings.includePinned || !t.pinned)
     .filter((t) => !knownTabIds.has(t.id))
-    .map((t) => ({
-      tabId: t.id,
-      windowId: t.windowId,
-      url: t.url,
-      title: t.title || t.url,
-      domain: computeDomain(t.url),
-      pinned: !!t.pinned,
-      discarded: !!t.discarded,
-      lastAccessed: t.lastAccessed || 0,
-    }));
+    .map((t) => {
+      const domain = computeDomain(t.url);
+      return {
+        tabId: t.id,
+        windowId: t.windowId,
+        url: t.url,
+        title: t.title || t.url,
+        domain,
+        repoKey: computeRepoKey(t.url, domain),
+        pinned: !!t.pinned,
+        discarded: !!t.discarded,
+        lastAccessed: t.lastAccessed || 0,
+      };
+    });
 
   if (newEntries.length === 0) return 0;
 
@@ -305,6 +357,7 @@ function renderCurrentCard(entry, favIconById) {
   const badges = document.createElement("div");
   badges.className = "card-badges";
   if (entry.domain) badges.appendChild(makeBadge(entry.domain));
+  if (entry.repoKey) badges.appendChild(makeBadge(repoDisplayLabel(entry.repoKey), "badge-repo"));
   if (entry.pinned) badges.appendChild(makeBadge("pinned", "badge-pinned"));
   if (entry.discarded) badges.appendChild(makeBadge("already unloaded", "badge-discarded"));
   textWrap.appendChild(badges);
@@ -377,6 +430,25 @@ function renderDomainBanner(entry, entries) {
     `${siblingCount} other tab${siblingCount === 1 ? "" : "s"} from ${entry.domain} open.`;
 }
 
+// Same idea as renderDomainBanner but one level more specific: same repo,
+// not just same host. Independent of the domain banner -- both can show at
+// once, since "other GitHub tabs" and "other tabs from this exact repo" are
+// both legitimately useful groupings to act on separately.
+function renderRepoBanner(entry, entries) {
+  if (!entry || !entry.repoKey) {
+    els.repoBanner.hidden = true;
+    return;
+  }
+  const siblingCount = entries.filter((e) => e.repoKey === entry.repoKey && e.tabId !== entry.tabId).length;
+  if (siblingCount === 0) {
+    els.repoBanner.hidden = true;
+    return;
+  }
+  els.repoBanner.hidden = false;
+  els.repoBannerText.textContent =
+    `${siblingCount} other tab${siblingCount === 1 ? "" : "s"} from ${repoDisplayLabel(entry.repoKey)} open.`;
+}
+
 function renderSummary(history, duplicatesClosedTotal) {
   const kept = history.filter((h) => h.decision === "keep").length;
   const thrown = history.filter((h) => h.decision === "throw").length;
@@ -408,6 +480,7 @@ async function render() {
     els.currentCard.hidden = true;
     els.duplicatePanel.hidden = true;
     els.domainBanner.hidden = true;
+    els.repoBanner.hidden = true;
     els.actionRow.hidden = true;
     const enteringSummary = els.summaryCard.hidden;
     els.summaryCard.hidden = false;
@@ -446,6 +519,7 @@ async function render() {
   renderCurrentCard(entry, favIconById);
   renderDuplicates(entry, liveTabs);
   renderDomainBanner(entry, entries);
+  renderRepoBanner(entry, entries);
 
   els.peekBtn.disabled = false;
   els.keepBtn.disabled = false;
@@ -548,12 +622,14 @@ async function undoLastClose() {
       // edge case. item.url/item.title were captured before the tab was
       // ever closed, so they're already ground truth -- no need to trust
       // (or poll around) the freshly-restored tab for those two fields.
+      const domain = computeDomain(item.url);
       const restoredEntry = {
         tabId: restoredTab.id,
         windowId: restoredTab.windowId,
         url: item.url,
         title: item.title,
-        domain: computeDomain(item.url),
+        domain,
+        repoKey: computeRepoKey(item.url, domain),
         pinned: !!restoredTab.pinned,
         discarded: !!restoredTab.discarded,
         lastAccessed: restoredTab.lastAccessed || Date.now(),
@@ -728,16 +804,20 @@ async function throwAllDuplicates() {
 // Moves every other pending entry sharing the current tab's domain to
 // right after the current position, wherever they currently sit in the
 // queue (before or after the cursor).
-async function bumpDomainSiblings() {
+// Shared by bumpDomainSiblings and bumpRepoSiblings -- both are "find every
+// other pending entry matching some key on the current entry, and move them
+// to right after it," just with a different key (domain vs. repo).
+async function bumpSiblingsBy(getKey, describeGroup) {
   const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
   const entries = (queue || []).slice();
   const pos = cursor || 0;
   const entry = entries[pos];
-  if (!entry || !entry.domain) return;
+  const key = entry && getKey(entry);
+  if (!entry || !key) return;
 
   const siblingIndexes = [];
   entries.forEach((e, i) => {
-    if (i !== pos && e.domain === entry.domain) siblingIndexes.push(i);
+    if (i !== pos && getKey(e) === key) siblingIndexes.push(i);
   });
   if (siblingIndexes.length === 0) return;
 
@@ -755,8 +835,16 @@ async function bumpDomainSiblings() {
   await browser.storage.session.set({ queue: entries, cursor: newPos });
   await render();
   showNotice(
-    `Moved ${siblings.length} tab${siblings.length === 1 ? "" : "s"} from ${entry.domain} to review right after this one.`
+    `Moved ${siblings.length} tab${siblings.length === 1 ? "" : "s"} from ${describeGroup(entry)} to review right after this one.`
   );
+}
+
+async function bumpDomainSiblings() {
+  await bumpSiblingsBy((e) => e.domain, (e) => e.domain);
+}
+
+async function bumpRepoSiblings() {
+  await bumpSiblingsBy((e) => e.repoKey, (e) => repoDisplayLabel(e.repoKey));
 }
 
 async function setCursor(newPos) {
@@ -847,6 +935,7 @@ async function init() {
   els.duplicateCloseBtn.addEventListener("click", closeDuplicates);
   els.duplicateThrowAllBtn.addEventListener("click", throwAllDuplicates);
   els.domainBumpBtn.addEventListener("click", bumpDomainSiblings);
+  els.repoBumpBtn.addEventListener("click", bumpRepoSiblings);
 
   els.stepBack10.addEventListener("click", () => stepCursor(-10));
   els.stepBack1.addEventListener("click", () => stepCursor(-1));
