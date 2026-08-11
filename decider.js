@@ -253,6 +253,46 @@ async function rebuildAndRender() {
   await render();
 }
 
+// "Forget decisions" throws away a whole session's progress with no undo,
+// and sits one stray click away from Settings in the header -- so it needs
+// a deliberate second click. Two-step inline rather than window.confirm(),
+// which blocks the page and looks nothing like the rest of the UI. Arming
+// auto-expires so the button can't sit in a dangerous state indefinitely.
+let resetConfirmTimer = null;
+
+function disarmResetConfirm() {
+  if (resetConfirmTimer !== null) {
+    clearTimeout(resetConfirmTimer);
+    resetConfirmTimer = null;
+  }
+  els.resetBtn.textContent = "Forget decisions";
+  els.resetBtn.classList.remove("btn-throw");
+}
+
+async function handleResetClick() {
+  if (resetConfirmTimer !== null) {
+    disarmResetConfirm();
+    await rebuildAndRender();
+    return;
+  }
+
+  // Nothing decided yet means nothing to lose -- skip the confirm entirely
+  // rather than nagging about discarding an empty history.
+  const { history } = await browser.storage.session.get("history");
+  const reviewedCount = (history || []).length;
+  if (reviewedCount === 0) {
+    await rebuildAndRender();
+    return;
+  }
+
+  els.resetBtn.textContent = "Click again to confirm";
+  els.resetBtn.classList.add("btn-throw");
+  resetConfirmTimer = setTimeout(disarmResetConfirm, 6000);
+  showNotice(
+    `This discards ${reviewedCount} reviewed tab${reviewedCount === 1 ? "" : "s"} of progress and rebuilds the queue. Click again to confirm.`
+  );
+}
+
 // Runs instead of buildQueue() when a session is already active (e.g. the
 // decider page was just reloaded, not opened fresh after a browser
 // restart). Leaves cursor, history, and existing queue entries completely
@@ -415,40 +455,46 @@ function renderDuplicates(entry, liveTabs) {
   }
 }
 
-// Also live and non-blocking: siblings are searched for across the whole
-// pending queue, not just what's ahead of the cursor.
-function renderDomainBanner(entry, entries) {
-  if (!entry || !entry.domain) {
+// Live and non-blocking: siblings are searched for across the whole pending
+// queue, not just what's ahead of the cursor.
+//
+// Domain and repo counts are gathered in ONE pass rather than two separate
+// .filter() scans. At a few hundred tabs that made no difference; at the
+// ~1,900 this actually gets used with, it was two full array walks on every
+// cursor step. The repo count is always a subset of the domain count (same
+// host, narrower path), but they're shown as independent banners because
+// "other tabs from github.com" and "other tabs from this exact repo" are
+// separately useful things to act on.
+function renderSiblingBanners(entry, entries) {
+  if (!entry) {
     els.domainBanner.hidden = true;
+    els.repoBanner.hidden = true;
     return;
   }
-  const siblingCount = entries.filter((e) => e.domain === entry.domain && e.tabId !== entry.tabId).length;
-  if (siblingCount === 0) {
-    els.domainBanner.hidden = true;
-    return;
-  }
-  els.domainBanner.hidden = false;
-  els.domainBannerText.textContent =
-    `${siblingCount} other tab${siblingCount === 1 ? "" : "s"} from ${entry.domain} open.`;
-}
 
-// Same idea as renderDomainBanner but one level more specific: same repo,
-// not just same host. Independent of the domain banner -- both can show at
-// once, since "other GitHub tabs" and "other tabs from this exact repo" are
-// both legitimately useful groupings to act on separately.
-function renderRepoBanner(entry, entries) {
-  if (!entry || !entry.repoKey) {
-    els.repoBanner.hidden = true;
-    return;
+  let domainCount = 0;
+  let repoCount = 0;
+  for (const e of entries) {
+    if (e.tabId === entry.tabId) continue;
+    if (entry.domain && e.domain === entry.domain) domainCount++;
+    if (entry.repoKey && e.repoKey === entry.repoKey) repoCount++;
   }
-  const siblingCount = entries.filter((e) => e.repoKey === entry.repoKey && e.tabId !== entry.tabId).length;
-  if (siblingCount === 0) {
-    els.repoBanner.hidden = true;
-    return;
+
+  if (!entry.domain || domainCount === 0) {
+    els.domainBanner.hidden = true;
+  } else {
+    els.domainBanner.hidden = false;
+    els.domainBannerText.textContent =
+      `${domainCount} other tab${domainCount === 1 ? "" : "s"} from ${entry.domain} open.`;
   }
-  els.repoBanner.hidden = false;
-  els.repoBannerText.textContent =
-    `${siblingCount} other tab${siblingCount === 1 ? "" : "s"} from ${repoDisplayLabel(entry.repoKey)} open.`;
+
+  if (!entry.repoKey || repoCount === 0) {
+    els.repoBanner.hidden = true;
+  } else {
+    els.repoBanner.hidden = false;
+    els.repoBannerText.textContent =
+      `${repoCount} other tab${repoCount === 1 ? "" : "s"} from ${repoDisplayLabel(entry.repoKey)} open.`;
+  }
 }
 
 function renderSummary(history, duplicatesClosedTotal) {
@@ -461,6 +507,10 @@ function renderSummary(history, duplicatesClosedTotal) {
 
 async function render() {
   clearNotice();
+  // Any other activity cancels a pending reset confirm -- otherwise the
+  // button could sit armed while the user does something else entirely,
+  // and their next click on it would wipe progress with no warning.
+  disarmResetConfirm();
 
   const { queue, cursor, history, duplicatesClosedTotal } = await browser.storage.session.get([
     "queue", "cursor", "history", "duplicatesClosedTotal",
@@ -520,8 +570,7 @@ async function render() {
 
   renderCurrentCard(entry, favIconById);
   renderDuplicates(entry, liveTabs);
-  renderDomainBanner(entry, entries);
-  renderRepoBanner(entry, entries);
+  renderSiblingBanners(entry, entries);
 
   els.peekBtn.disabled = false;
   els.keepBtn.disabled = false;
@@ -560,36 +609,71 @@ async function ensureNotActiveInWindow(tabId, windowId) {
   return true;
 }
 
-// sessions.getRecentlyClosed can lag a beat behind the actual tabs.remove()
-// call, so poll briefly rather than assuming it's there on the first check.
-async function findRecentlyClosedSessionId(url) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const sessions = await browser.sessions.getRecentlyClosed({ maxResults: 10 });
-      const match = sessions.find((s) => s.tab && s.tab.url === url);
-      if (match) return match.tab.sessionId;
-    } catch (err) {
-      console.warn("Tab Decider: couldn't read recently-closed sessions", err);
-      return null;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 150));
-  }
-  return null;
-}
-
 // Called right after any tab-closing action. `closedItems` is what was just
 // closed (each flagged `wasCurrent` if it was the entry actually being
 // decided, vs. a duplicate closed alongside it). `historyEntriesToRemove`
 // and `duplicatesToUncount` let undo roll back the session-stats bookkeeping
 // too, not just reopen the tabs.
+//
+// Two things this has to get right, both of which the earlier per-item
+// version got wrong:
+//
+//  1. Duplicates share a URL by definition, so matching on URL alone and
+//     taking the first hit handed back the SAME sessionId for every one of
+//     them -- undo then tried to restore one tab N times instead of N tabs
+//     once. Session ids are claimed here as they're matched, so each closed
+//     tab maps to a distinct closed-session entry.
+//
+//  2. getRecentlyClosed() is queried once per attempt for the whole batch,
+//     not once per item. The old code polled 5 x 150ms PER ITEM, so a
+//     Throw All over tabs Firefox doesn't record in closed-tab history
+//     (about: pages, for instance) stalled the UI for seconds. Worst case
+//     here is now three lookups total regardless of batch size.
 async function captureClosedForUndo(closedItems, historyEntriesToRemove, duplicatesToUncount) {
+  if (closedItems.length === 0) return;
+
   const items = [];
-  for (const closed of closedItems) {
-    const sessionId = await findRecentlyClosedSessionId(closed.url);
-    if (sessionId) {
-      items.push({ sessionId, url: closed.url, title: closed.title, wasCurrent: closed.wasCurrent });
+  const claimedSessionIds = new Set();
+  let pending = closedItems.slice();
+
+  for (let attempt = 0; attempt < 3 && pending.length > 0; attempt++) {
+    let sessions = [];
+    try {
+      sessions = await browser.sessions.getRecentlyClosed({
+        maxResults: Math.min(100, Math.max(25, closedItems.length * 2)),
+      });
+    } catch (err) {
+      console.warn("Tab Decider: couldn't read recently-closed sessions", err);
+      break;
+    }
+
+    const stillPending = [];
+    for (const closed of pending) {
+      const match = sessions.find(
+        (s) => s.tab && s.tab.url === closed.url && !claimedSessionIds.has(s.tab.sessionId)
+      );
+      if (match) {
+        claimedSessionIds.add(match.tab.sessionId);
+        items.push({
+          sessionId: match.tab.sessionId,
+          url: closed.url,
+          title: closed.title,
+          wasCurrent: closed.wasCurrent,
+        });
+      } else {
+        stillPending.push(closed);
+      }
+    }
+    pending = stillPending;
+
+    // Firefox can lag a beat behind tabs.remove() before a tab shows up in
+    // closed-tab history, so retry briefly -- but only if something's
+    // actually still missing.
+    if (pending.length > 0 && attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
     }
   }
+
   if (items.length === 0) return;
   await browser.storage.session.set({
     lastClosedAction: { items, historyEntriesToRemove, duplicatesToUncount, closedAt: Date.now() },
@@ -752,12 +836,14 @@ async function closeDuplicates() {
     }
   }
 
+  // Count only what actually closed, not what we attempted -- a failed
+  // tabs.remove() used to still inflate the session total (and the notice).
   const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
-  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + toClose.length });
+  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + closedItems.length });
 
   await render();
   await captureClosedForUndo(closedItems, 0, closedItems.length);
-  showNotice(`Closed ${toClose.length} duplicate tab${toClose.length === 1 ? "" : "s"}.`, true);
+  showNotice(`Closed ${closedItems.length} duplicate tab${closedItems.length === 1 ? "" : "s"}.`, true);
 }
 
 // Closes the current entry AND every duplicate match together, regardless
@@ -918,7 +1004,9 @@ async function init() {
     return decide(message.action);
   });
 
-  els.resetBtn.addEventListener("click", rebuildAndRender);
+  els.resetBtn.addEventListener("click", handleResetClick);
+  // No confirm needed here: the summary only appears once the queue is
+  // already empty, so there's no in-progress review left to lose.
   els.summaryRestartBtn.addEventListener("click", rebuildAndRender);
   els.noticeUndoBtn.addEventListener("click", undoLastClose);
 
