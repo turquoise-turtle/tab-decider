@@ -342,11 +342,13 @@ function renderCurrentCard(entry, favIconById) {
   const title = document.createElement("div");
   title.className = "card-title";
   title.textContent = entry.title;
+  title.title = entry.title;
   textWrap.appendChild(title);
 
   const url = document.createElement("div");
   url.className = "card-url";
   url.textContent = entry.url;
+  url.title = entry.url;
   textWrap.appendChild(url);
 
   const meta = document.createElement("div");
