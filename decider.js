@@ -44,6 +44,9 @@ const els = {
   settingIncludePinned: document.getElementById("setting-include-pinned"),
   settingSortOrder: document.getElementById("setting-sort-order"),
   shortcutsList: document.getElementById("shortcuts-list"),
+  filterInput: document.getElementById("filter-input"),
+  filterClearBtn: document.getElementById("filter-clear-btn"),
+  filterStatus: document.getElementById("filter-status"),
   positionLabel: document.getElementById("position-label"),
   jumpInput: document.getElementById("jump-input"),
   jumpBtn: document.getElementById("jump-btn"),
@@ -246,6 +249,49 @@ async function buildQueue(selfTabId) {
   return entries;
 }
 
+// Two-step inline confirm, reusable by any destructive button. Chosen over
+// window.confirm() because that blocks the page and looks nothing like the
+// rest of the UI. Arming auto-expires so a button can never sit in a
+// dangerous state indefinitely, and render() disarms too -- otherwise a
+// button could stay armed while the user does something else entirely and
+// their next click would fire it with no warning.
+const CONFIRM_TIMEOUT_MS = 6000;
+
+// Any action closing more than this many tabs at once asks first.
+const BULK_CONFIRM_THRESHOLD = 5;
+
+let pendingConfirm = null; // { btn, label, className, timer }
+
+function disarmConfirm() {
+  if (!pendingConfirm) return;
+  clearTimeout(pendingConfirm.timer);
+  pendingConfirm.btn.textContent = pendingConfirm.label;
+  pendingConfirm.btn.className = pendingConfirm.className;
+  pendingConfirm = null;
+}
+
+// Returns true when this is the confirming (second) click, false when it
+// has just armed and is waiting. Callers bail out on false.
+function requestConfirm(btn, confirmLabel, message) {
+  if (pendingConfirm && pendingConfirm.btn === btn) {
+    disarmConfirm();
+    return true;
+  }
+  disarmConfirm();
+
+  pendingConfirm = {
+    btn,
+    label: btn.textContent,
+    className: btn.className,
+    timer: setTimeout(disarmConfirm, CONFIRM_TIMEOUT_MS),
+  };
+  btn.textContent = confirmLabel;
+  btn.classList.remove("btn-neutral");
+  btn.classList.add("btn-throw");
+  showNotice(message);
+  return false;
+}
+
 async function rebuildAndRender() {
   els.progress.textContent = "Rebuilding...";
   const selfTab = await browser.tabs.getCurrent();
@@ -254,28 +300,8 @@ async function rebuildAndRender() {
 }
 
 // "Forget decisions" throws away a whole session's progress with no undo,
-// and sits one stray click away from Settings in the header -- so it needs
-// a deliberate second click. Two-step inline rather than window.confirm(),
-// which blocks the page and looks nothing like the rest of the UI. Arming
-// auto-expires so the button can't sit in a dangerous state indefinitely.
-let resetConfirmTimer = null;
-
-function disarmResetConfirm() {
-  if (resetConfirmTimer !== null) {
-    clearTimeout(resetConfirmTimer);
-    resetConfirmTimer = null;
-  }
-  els.resetBtn.textContent = "Forget decisions";
-  els.resetBtn.classList.remove("btn-throw");
-}
-
+// and sits one stray click away from Settings in the header.
 async function handleResetClick() {
-  if (resetConfirmTimer !== null) {
-    disarmResetConfirm();
-    await rebuildAndRender();
-    return;
-  }
-
   // Nothing decided yet means nothing to lose -- skip the confirm entirely
   // rather than nagging about discarding an empty history.
   const { history } = await browser.storage.session.get("history");
@@ -285,12 +311,12 @@ async function handleResetClick() {
     return;
   }
 
-  els.resetBtn.textContent = "Click again to confirm";
-  els.resetBtn.classList.add("btn-throw");
-  resetConfirmTimer = setTimeout(disarmResetConfirm, 6000);
-  showNotice(
+  const confirmed = requestConfirm(
+    els.resetBtn,
+    "Click again to confirm",
     `This discards ${reviewedCount} reviewed tab${reviewedCount === 1 ? "" : "s"} of progress and rebuilds the queue. Click again to confirm.`
   );
+  if (confirmed) await rebuildAndRender();
 }
 
 // Runs instead of buildQueue() when a session is already active (e.g. the
@@ -520,28 +546,48 @@ function renderSummary(history, duplicatesClosedTotal) {
 
 async function render() {
   clearNotice();
-  // Any other activity cancels a pending reset confirm -- otherwise the
-  // button could sit armed while the user does something else entirely,
-  // and their next click on it would wipe progress with no warning.
-  disarmResetConfirm();
+  // Any other activity cancels a pending confirm -- otherwise a button
+  // could sit armed while the user does something else entirely, and their
+  // next click on it would fire it with no warning.
+  disarmConfirm();
 
-  const { queue, cursor, history, duplicatesClosedTotal } = await browser.storage.session.get([
-    "queue", "cursor", "history", "duplicatesClosedTotal",
+  const { history, duplicatesClosedTotal } = await browser.storage.session.get([
+    "history", "duplicatesClosedTotal",
   ]);
-  const entries = queue || [];
+  const view = await getView();
+  const entries = view.entries;
   const reviewedCount = (history || []).length;
   const dupCount = duplicatesClosedTotal || 0;
 
   els.progress.textContent =
-    `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue · ` +
+    `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue \u00b7 ` +
     `${reviewedCount} reviewed` +
-    (dupCount ? ` · ${dupCount} duplicate${dupCount === 1 ? "" : "s"} closed` : "") +
+    (dupCount ? ` \u00b7 ${dupCount} duplicate${dupCount === 1 ? "" : "s"} closed` : "") +
     ` this session`;
 
+  // Keep the input in sync without stomping what the user is mid-typing.
+  if (document.activeElement !== els.filterInput) {
+    els.filterInput.value = view.query;
+  }
+  els.filterClearBtn.hidden = !view.query;
+  els.filterStatus.textContent = view.query
+    ? `${view.viewSize} of ${entries.length} match`
+    : "";
+
+  const hasEntry = !!view.entry;
+  els.peekBtn.disabled = !hasEntry;
+  els.keepBtn.disabled = !hasEntry;
+  els.throwBtn.disabled = !hasEntry;
+  els.stepBack10.disabled = !hasEntry || view.viewPos <= 0;
+  els.stepBack1.disabled = !hasEntry || view.viewPos <= 0;
+  els.stepFwd1.disabled = !hasEntry || view.viewPos >= view.viewSize - 1;
+  els.stepFwd10.disabled = !hasEntry || view.viewPos >= view.viewSize - 1;
+  els.jumpInput.value = "";
+
+  // The whole queue is done -- that's the session summary. Distinct from a
+  // filter simply matching nothing, which is not an end state.
   if (entries.length === 0) {
     els.positionLabel.textContent = "Queue empty";
-    els.jumpInput.value = "";
-
     els.currentCard.hidden = true;
     els.duplicatePanel.hidden = true;
     els.domainBanner.hidden = true;
@@ -550,40 +596,49 @@ async function render() {
     const enteringSummary = els.summaryCard.hidden;
     els.summaryCard.hidden = false;
     renderSummary(history || [], dupCount);
-    if (enteringSummary) {
-      els.summaryRestartBtn.focus();
-    }
-
-    els.peekBtn.disabled = true;
-    els.keepBtn.disabled = true;
-    els.throwBtn.disabled = true;
-    els.stepBack10.disabled = true;
-    els.stepBack1.disabled = true;
-    els.stepFwd1.disabled = true;
-    els.stepFwd10.disabled = true;
+    if (enteringSummary) els.summaryRestartBtn.focus();
     return;
   }
 
   els.summaryCard.hidden = true;
   els.currentCard.hidden = false;
-  els.actionRow.hidden = false;
 
-  const rawCursor = cursor || 0;
-  const pos = Math.max(0, Math.min(rawCursor, entries.length - 1));
-  if (pos !== rawCursor) {
-    await browser.storage.session.set({ cursor: pos }); // correct drift after external changes
+  // Filter matched nothing: say so plainly rather than showing the summary
+  // (nothing is finished) or a blank card.
+  if (!hasEntry) {
+    els.positionLabel.textContent = "No matches";
+    els.currentCard.textContent = "";
+    const p = document.createElement("p");
+    p.className = "empty";
+    p.textContent = `Nothing in the queue matches \u201c${view.query}\u201d.`;
+    els.currentCard.appendChild(p);
+    els.duplicatePanel.hidden = true;
+    els.domainBanner.hidden = true;
+    els.repoBanner.hidden = true;
+    els.actionRow.hidden = true;
+    return;
   }
 
-  els.positionLabel.textContent = `Viewing #${pos + 1} of ${entries.length}`;
-  els.jumpInput.value = "";
+  els.actionRow.hidden = false;
 
-  const entry = entries[pos];
+  // Snapping can land the cursor on a different entry than stored (e.g. the
+  // filter excluded where it was); persist that so navigation continues
+  // from what is actually on screen.
+  if (view.queueIndex !== undefined && view.queueIndex >= 0) {
+    await browser.storage.session.set({ cursor: view.queueIndex });
+  }
+
+  els.positionLabel.textContent = view.query
+    ? `Viewing #${view.viewPos + 1} of ${view.viewSize} matching`
+    : `Viewing #${view.viewPos + 1} of ${view.viewSize}`;
+
+  const entry = view.entry;
 
   // One tabs.get() for the current entry, instead of the tabs.query({})
   // this used to run on every single render -- that pulled every open tab
   // (~1,900 in real use) and built a favicon Map of all of them just to
-  // read one entry's icon. Duplicates no longer need the full list either,
-  // since they're matched against the queue now.
+  // read one entry\u2019s icon. Duplicates no longer need the full list
+  // either, since they\u2019re matched against the queue now.
   let liveTab = null;
   try {
     liveTab = await browser.tabs.get(entry.tabId);
@@ -593,16 +648,11 @@ async function render() {
   }
 
   renderCurrentCard(entry, liveTab);
+  // Duplicates and sibling counts are deliberately computed against the
+  // FULL queue, not the filtered view: a duplicate you can't see because
+  // of a filter is still a duplicate, and hiding it would be misleading.
   renderDuplicates(entry, entries);
   renderSiblingBanners(entry, entries);
-
-  els.peekBtn.disabled = false;
-  els.keepBtn.disabled = false;
-  els.throwBtn.disabled = false;
-  els.stepBack10.disabled = pos <= 0;
-  els.stepBack1.disabled = pos <= 0;
-  els.stepFwd1.disabled = pos >= entries.length - 1;
-  els.stepFwd10.disabled = pos >= entries.length - 1;
 }
 
 // Firefox refuses to discard a window's *active* tab (the promise just
@@ -780,10 +830,8 @@ async function undoLastClose() {
 }
 
 async function decide(action) {
-  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
-  const entries = queue || [];
-  const pos = cursor || 0;
-  const entry = entries[pos];
+  const view = await getView();
+  const entry = view.entry;
   if (!entry) return;
 
   if (action === "keep") {
@@ -893,9 +941,18 @@ async function closeDuplicates() {
 async function throwAllDuplicates() {
   if (currentDuplicateMatches.length === 0) return;
 
-  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
-  const entries = queue || [];
-  const entry = entries[cursor || 0];
+  const totalToClose = currentDuplicateMatches.length + 1; // + the current tab
+  if (totalToClose > BULK_CONFIRM_THRESHOLD) {
+    const confirmed = requestConfirm(
+      els.duplicateThrowAllBtn,
+      `Close ${totalToClose} tabs?`,
+      `This closes ${totalToClose} tabs at once -- this one plus ${currentDuplicateMatches.length} duplicates. Click again to confirm.`
+    );
+    if (!confirmed) return;
+  }
+
+  const view = await getView();
+  const entry = view.entry;
   if (!entry) return;
 
   const matches = currentDuplicateMatches.slice();
@@ -933,12 +990,12 @@ async function throwAllDuplicates() {
 // other pending entry matching some key on the current entry, and move them
 // to right after it," just with a different key (domain vs. repo).
 async function bumpSiblingsBy(getKey, describeGroup) {
-  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
-  const entries = (queue || []).slice();
-  const pos = cursor || 0;
-  const entry = entries[pos];
+  const view = await getView();
+  const entries = view.entries.slice();
+  const pos = view.queueIndex; // full-queue index, not the filtered position
+  const entry = view.entry;
   const key = entry && getKey(entry);
-  if (!entry || !key) return;
+  if (!entry || pos < 0 || !key) return;
 
   const siblingIndexes = [];
   entries.forEach((e, i) => {
@@ -972,29 +1029,127 @@ async function bumpRepoSiblings() {
   await bumpSiblingsBy((e) => e.repoKey, (e) => repoDisplayLabel(e.repoKey));
 }
 
-async function setCursor(newPos) {
-  const { queue } = await browser.storage.session.get("queue");
+// --- Filter (10B) -------------------------------------------------------
+//
+// `cursor` deliberately remains an index into the FULL queue, not the
+// filtered view. Keeping one canonical coordinate space means decisions,
+// bumping, undo and background.js's onRemoved pruning all keep working
+// unchanged -- only display and navigation are translated into filtered
+// space. The alternative (cursor indexes the filtered list) would have made
+// every one of those paths filter-aware.
+//
+// matchIndices is the bridge: an ascending array of full-queue indices that
+// match the current filter. Position "#3 of 47" means matchIndices[2].
+
+function matchesFilter(entry, lowerQuery) {
+  return (
+    entry.title.toLowerCase().includes(lowerQuery) ||
+    entry.url.toLowerCase().includes(lowerQuery)
+  );
+}
+
+function computeMatchIndices(entries, query) {
+  if (!query) return null; // null = no filter active, whole queue is the view
+  const q = query.toLowerCase();
+  const indices = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (matchesFilter(entries[i], q)) indices.push(i);
+  }
+  return indices;
+}
+
+// Where the cursor sits within the filtered view. If the cursor's entry
+// doesn't itself match (very common -- you filter while parked on a
+// non-matching tab), snap forward to the next match so the view lands
+// somewhere sensible instead of nowhere.
+function resolveViewPosition(matchIndices, cursor) {
+  if (matchIndices.length === 0) return -1;
+  const exact = matchIndices.indexOf(cursor);
+  if (exact !== -1) return exact;
+  for (let i = 0; i < matchIndices.length; i++) {
+    if (matchIndices[i] >= cursor) return i;
+  }
+  return matchIndices.length - 1;
+}
+
+// Single place that resolves "what is the user actually looking at right
+// now", so render() and every navigation path agree.
+async function getView() {
+  const { queue, cursor, filterQuery } = await browser.storage.session.get([
+    "queue", "cursor", "filterQuery",
+  ]);
   const entries = queue || [];
-  const clamped = entries.length === 0 ? 0 : Math.max(0, Math.min(newPos, entries.length - 1));
-  await browser.storage.session.set({ cursor: clamped });
+  const query = filterQuery || "";
+  const rawCursor = cursor || 0;
+
+  const matchIndices = computeMatchIndices(entries, query);
+  if (matchIndices === null) {
+    const pos = entries.length === 0 ? -1 : Math.max(0, Math.min(rawCursor, entries.length - 1));
+    return {
+      entries, query, matchIndices: null,
+      viewSize: entries.length,
+      viewPos: pos,
+      queueIndex: pos,
+      entry: pos === -1 ? null : entries[pos],
+    };
+  }
+
+  const viewPos = resolveViewPosition(matchIndices, rawCursor);
+  const queueIndex = viewPos === -1 ? -1 : matchIndices[viewPos];
+  return {
+    entries, query, matchIndices,
+    viewSize: matchIndices.length,
+    viewPos,
+    queueIndex,
+    entry: queueIndex === -1 ? null : entries[queueIndex],
+  };
+}
+
+// Moves within the CURRENT view (filtered or not), then writes the result
+// back as a full-queue cursor index.
+async function setViewPosition(newViewPos) {
+  const view = await getView();
+  if (view.viewSize === 0) return;
+  const clamped = Math.max(0, Math.min(newViewPos, view.viewSize - 1));
+  const queueIndex = view.matchIndices === null ? clamped : view.matchIndices[clamped];
+  await browser.storage.session.set({ cursor: queueIndex });
   await render();
 }
 
 async function stepCursor(delta) {
-  const { cursor } = await browser.storage.session.get("cursor");
-  await setCursor((cursor || 0) + delta);
+  const view = await getView();
+  if (view.viewPos === -1) return;
+  await setViewPosition(view.viewPos + delta);
 }
 
 async function jumpToInput() {
   const raw = parseInt(els.jumpInput.value, 10);
   if (Number.isNaN(raw)) return;
-  await setCursor(raw - 1); // input is shown/entered as 1-based
+  await setViewPosition(raw - 1); // input is shown/entered as 1-based
+}
+
+let filterDebounceTimer = null;
+
+// Debounced: at ~1,900 entries, re-filtering and re-rendering on every
+// keystroke is enough work to feel laggy while typing.
+function onFilterInput() {
+  clearTimeout(filterDebounceTimer);
+  filterDebounceTimer = setTimeout(async () => {
+    await browser.storage.session.set({ filterQuery: els.filterInput.value.trim() });
+    await render();
+  }, 150);
+}
+
+async function clearFilter() {
+  clearTimeout(filterDebounceTimer);
+  els.filterInput.value = "";
+  await browser.storage.session.set({ filterQuery: "" });
+  await render();
 }
 
 async function peekCurrent() {
-  const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
-  const entries = queue || [];
-  const entry = entries[cursor || 0];
+  const view = await getView();
+  const entry = view.entry;
   if (!entry) return;
 
   try {
@@ -1004,6 +1159,73 @@ async function peekCurrent() {
     // Tab's gone -- background.js's onRemoved listener will prune it;
     // just re-render so the UI catches up.
     await render();
+  }
+}
+
+// Page-level shortcuts, deliberately NOT manifest commands. Manifest
+// commands are global (they fire from any tab), which is exactly why Keep
+// and Throw need them -- you press those while looking at a peeked tab.
+// Peek, stepping, undo and filtering are only ever used while you're
+// already on this page, so plain keydown handling works: no manifest
+// changes, no OS-level shortcut conflicts, and no cap on how many.
+function onPageKeydown(e) {
+  // Never hijack typing, and leave OS/browser combos alone.
+  const tag = e.target && e.target.tagName;
+  const isTyping = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target.isContentEditable;
+
+  if (e.key === "Escape") {
+    if (pendingConfirm) {
+      disarmConfirm();
+      clearNotice();
+      e.preventDefault();
+      return;
+    }
+    if (isTyping && e.target === els.filterInput) {
+      clearFilter();
+      els.filterInput.blur();
+      e.preventDefault();
+    }
+    return;
+  }
+
+  if (isTyping) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+  switch (e.key) {
+    case "/":
+      els.filterInput.focus();
+      els.filterInput.select();
+      e.preventDefault();
+      break;
+    case "Enter":
+      if (!els.keepBtn.disabled) decide("keep");
+      e.preventDefault();
+      break;
+    case "x":
+    case "X":
+      if (!els.throwBtn.disabled) decide("throw");
+      e.preventDefault();
+      break;
+    case "p":
+    case "P":
+      if (!els.peekBtn.disabled) peekCurrent();
+      e.preventDefault();
+      break;
+    case "u":
+    case "U":
+      if (!els.noticeUndoBtn.hidden) undoLastClose();
+      e.preventDefault();
+      break;
+    case "ArrowRight":
+      stepCursor(e.shiftKey ? 10 : 1);
+      e.preventDefault();
+      break;
+    case "ArrowLeft":
+      stepCursor(e.shiftKey ? -10 : -1);
+      e.preventDefault();
+      break;
+    default:
+      break;
   }
 }
 
@@ -1072,6 +1294,10 @@ async function init() {
   els.jumpInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") jumpToInput();
   });
+
+  els.filterInput.addEventListener("input", onFilterInput);
+  els.filterClearBtn.addEventListener("click", clearFilter);
+  document.addEventListener("keydown", onPageKeydown);
 }
 
 init();

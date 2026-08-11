@@ -31,12 +31,31 @@
     </label>
     <p class="settings-hint">Changing either of these rebuilds the queue from scratch.</p>
     <div class="settings-shortcuts">
-      <p class="settings-hint">Keyboard shortcuts</p>
+      <p class="settings-hint">Global shortcuts (work from any tab)</p>
       <ul id="shortcuts-list" class="shortcuts-list"></ul>
+    </div>
+    <div class="settings-shortcuts">
+      <p class="settings-hint">On this page</p>
+      <ul class="shortcuts-list">
+        <li><kbd>Enter</kbd>Keep (unload)</li>
+        <li><kbd>x</kbd>Throw (close)</li>
+        <li><kbd>p</kbd>Peek at this tab</li>
+        <li><kbd>→ / ←</kbd>Skip / back 1</li>
+        <li><kbd>Shift + → / ←</kbd>Skip / back 10</li>
+        <li><kbd>u</kbd>Undo last close</li>
+        <li><kbd>/</kbd>Focus the filter</li>
+        <li><kbd>Esc</kbd>Clear filter / cancel confirm</li>
+      </ul>
     </div>
   </div>
 
   <main id="review-main">
+  <div id="filter-bar">
+    <input id="filter-input" type="search" placeholder="Filter by title or URL…" aria-label="Filter queue by title or URL" />
+    <button id="filter-clear-btn" class="btn-neutral" title="Clear the filter and return to the full queue" hidden>Clear</button>
+    <span id="filter-status"></span>
+  </div>
+
   <div id="position-bar">
     <span id="position-label">—</span>
     <div id="position-controls">
