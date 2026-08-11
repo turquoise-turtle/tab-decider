@@ -1,3 +1,6 @@
+// @ts-check
+/* global browser */
+
 // background.js — Tab Decider
 //
 // Kept deliberately thin: this file only opens/focuses the decider tab and

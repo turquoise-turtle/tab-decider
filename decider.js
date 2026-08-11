@@ -37,50 +37,116 @@
 // browser.storage.local only holds durable user settings (includePinned,
 // sortOrder).
 
+// @ts-check
+/* global browser */
+
+/**
+ * @typedef {"keep" | "throw"} DecisionAction
+ * @typedef {"lru" | "tab-order"} SortOrder
+ */
+
+/**
+ * A tab as stored in the review queue. Note url/title/domain/repoKey are
+ * SNAPSHOTS from when the entry was built -- a tab that navigates afterwards
+ * keeps its old values here until the queue is rebuilt, which is why
+ * destructive paths re-verify against the live tab first.
+ * @typedef {object} QueueEntry
+ * @property {number} tabId
+ * @property {number} windowId
+ * @property {string} url
+ * @property {string} title
+ * @property {string|null} domain
+ * @property {string|null} repoKey
+ * @property {boolean} pinned
+ * @property {boolean} discarded
+ * @property {number} lastAccessed
+ */
+
+/**
+ * @typedef {object} HistoryEntry
+ * @property {number} tabId
+ * @property {string} url
+ * @property {string} title
+ * @property {DecisionAction} decision
+ * @property {number} decidedAt
+ */
+
+/**
+ * @typedef {object} DuplicateMatch
+ * @property {number} tabId
+ * @property {string} url
+ * @property {string} title
+ * @property {boolean} sameWindow
+ * @property {boolean} checked
+ */
+
+/**
+ * @typedef {object} ClosedItem
+ * @property {string} url
+ * @property {string} title
+ * @property {boolean} wasCurrent
+ */
+
+/**
+ * @typedef {object} SessionState
+ * @property {QueueEntry[]} queue
+ * @property {number} cursor
+ * @property {HistoryEntry[]} history
+ * @property {number} duplicatesClosedTotal
+ * @property {string} filterQuery
+ * @property {boolean} sessionActive
+ */
+
+/**
+ * @typedef {object} Settings
+ * @property {boolean} includePinned
+ * @property {SortOrder} sortOrder
+ */
+
 const els = {
   progress: document.getElementById("progress"),
-  settingsToggleBtn: document.getElementById("settings-toggle-btn"),
+  settingsToggleBtn: /** @type {HTMLButtonElement} */ (document.getElementById("settings-toggle-btn")),
   settingsPanel: document.getElementById("settings-panel"),
-  settingIncludePinned: document.getElementById("setting-include-pinned"),
-  settingSortOrder: document.getElementById("setting-sort-order"),
+  settingIncludePinned: /** @type {HTMLInputElement} */ (document.getElementById("setting-include-pinned")),
+  settingSortOrder: /** @type {HTMLSelectElement} */ (document.getElementById("setting-sort-order")),
   shortcutsList: document.getElementById("shortcuts-list"),
   reviewMain: document.getElementById("review-main"),
   announcer: document.getElementById("announcer"),
-  filterInput: document.getElementById("filter-input"),
-  filterClearBtn: document.getElementById("filter-clear-btn"),
+  filterInput: /** @type {HTMLInputElement} */ (document.getElementById("filter-input")),
+  filterClearBtn: /** @type {HTMLButtonElement} */ (document.getElementById("filter-clear-btn")),
   filterStatus: document.getElementById("filter-status"),
   positionLabel: document.getElementById("position-label"),
-  jumpInput: document.getElementById("jump-input"),
-  jumpBtn: document.getElementById("jump-btn"),
-  stepBack10: document.getElementById("step-back-10"),
-  stepBack1: document.getElementById("step-back-1"),
-  stepFwd1: document.getElementById("step-fwd-1"),
-  stepFwd10: document.getElementById("step-fwd-10"),
+  jumpInput: /** @type {HTMLInputElement} */ (document.getElementById("jump-input")),
+  jumpBtn: /** @type {HTMLButtonElement} */ (document.getElementById("jump-btn")),
+  stepBack10: /** @type {HTMLButtonElement} */ (document.getElementById("step-back-10")),
+  stepBack1: /** @type {HTMLButtonElement} */ (document.getElementById("step-back-1")),
+  stepFwd1: /** @type {HTMLButtonElement} */ (document.getElementById("step-fwd-1")),
+  stepFwd10: /** @type {HTMLButtonElement} */ (document.getElementById("step-fwd-10")),
   currentCard: document.getElementById("current-card"),
   notice: document.getElementById("notice"),
   noticeText: document.getElementById("notice-text"),
-  noticeUndoBtn: document.getElementById("notice-undo-btn"),
-  resetBtn: document.getElementById("reset-btn"),
+  noticeUndoBtn: /** @type {HTMLButtonElement} */ (document.getElementById("notice-undo-btn")),
+  resetBtn: /** @type {HTMLButtonElement} */ (document.getElementById("reset-btn")),
   actionRow: document.getElementById("action-row"),
-  peekBtn: document.getElementById("peek-btn"),
-  keepBtn: document.getElementById("keep-btn"),
-  throwBtn: document.getElementById("throw-btn"),
+  peekBtn: /** @type {HTMLButtonElement} */ (document.getElementById("peek-btn")),
+  keepBtn: /** @type {HTMLButtonElement} */ (document.getElementById("keep-btn")),
+  throwBtn: /** @type {HTMLButtonElement} */ (document.getElementById("throw-btn")),
   duplicatePanel: document.getElementById("duplicate-panel"),
   duplicateSummary: document.getElementById("duplicate-summary"),
   duplicateList: document.getElementById("duplicate-list"),
-  duplicateCloseBtn: document.getElementById("duplicate-close-btn"),
-  duplicateThrowAllBtn: document.getElementById("duplicate-throw-all-btn"),
+  duplicateCloseBtn: /** @type {HTMLButtonElement} */ (document.getElementById("duplicate-close-btn")),
+  duplicateThrowAllBtn: /** @type {HTMLButtonElement} */ (document.getElementById("duplicate-throw-all-btn")),
   domainBanner: document.getElementById("domain-banner"),
   domainBannerText: document.getElementById("domain-banner-text"),
-  domainBumpBtn: document.getElementById("domain-bump-btn"),
+  domainBumpBtn: /** @type {HTMLButtonElement} */ (document.getElementById("domain-bump-btn")),
   repoBanner: document.getElementById("repo-banner"),
   repoBannerText: document.getElementById("repo-banner-text"),
-  repoBumpBtn: document.getElementById("repo-bump-btn"),
+  repoBumpBtn: /** @type {HTMLButtonElement} */ (document.getElementById("repo-bump-btn")),
   summaryCard: document.getElementById("summary-card"),
   summaryKept: document.getElementById("summary-kept"),
   summaryThrown: document.getElementById("summary-thrown"),
   summaryDuplicates: document.getElementById("summary-duplicates"),
-  summaryRestartBtn: document.getElementById("summary-restart-btn"),
+  summaryRestartBtn: /** @type {HTMLButtonElement} */ (document.getElementById("summary-restart-btn")),
 };
 
 // Transient, recomputed on every render -- not persisted. Just lets the
@@ -250,6 +316,93 @@ async function renderShortcutsList() {
   }
 }
 
+/**
+ * The one place a browser Tab becomes a QueueEntry. Previously this mapping
+ * was copy-pasted in buildQueue, mergeNewTabs and undoLastClose, so every new
+ * field (repoKey was the last one) had to be added in three places or the
+ * three would silently disagree.
+ *
+ * `override` exists for undo: a restored tab's url/title can still be
+ * mid-navigation ("about:blank") at the moment sessions.restore() resolves,
+ * so the caller passes the values captured before the tab was closed.
+ *
+ * @param {any} tab
+ * @param {{url?: string, title?: string, lastAccessed?: number}} [override]
+ * @returns {QueueEntry}
+ */
+function tabToQueueEntry(tab, override = {}) {
+  const url = override.url ?? tab.url ?? "";
+  const title = override.title ?? tab.title ?? url;
+  const domain = computeDomain(url);
+  return {
+    tabId: tab.id,
+    windowId: tab.windowId,
+    url,
+    title,
+    domain,
+    repoKey: computeRepoKey(url, domain),
+    pinned: Boolean(tab.pinned),
+    discarded: Boolean(tab.discarded),
+    lastAccessed: override.lastAccessed ?? tab.lastAccessed ?? 0,
+  };
+}
+
+/**
+ * Persisted state is not inherently trustworthy: an extension reload mid-
+ * session, or a build with a different schema, can leave shapes that no
+ * longer match what the code expects. Normalising on read means a damaged
+ * value degrades to a sane default instead of throwing somewhere deep in
+ * render().
+ * @param {any} raw
+ * @returns {SessionState}
+ */
+function normaliseSessionState(raw) {
+  const state = raw && typeof raw === "object" ? raw : {};
+  const queue = Array.isArray(state.queue) ? state.queue.filter(isQueueEntry) : [];
+  const cursor = Number.isSafeInteger(state.cursor) && state.cursor >= 0 ? state.cursor : 0;
+  return {
+    queue,
+    // Clamp here as well as in getView: a cursor past the end of a recovered
+    // queue would otherwise render nothing at all.
+    cursor: queue.length === 0 ? 0 : Math.min(cursor, queue.length - 1),
+    history: Array.isArray(state.history) ? state.history.filter(isHistoryEntry) : [],
+    duplicatesClosedTotal:
+      Number.isSafeInteger(state.duplicatesClosedTotal) && state.duplicatesClosedTotal >= 0
+        ? state.duplicatesClosedTotal
+        : 0,
+    filterQuery: typeof state.filterQuery === "string" ? state.filterQuery : "",
+    sessionActive: state.sessionActive === true,
+  };
+}
+
+/** @param {any} value @returns {boolean} */
+function isQueueEntry(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    Number.isInteger(value.tabId) &&
+    typeof value.url === "string" &&
+    typeof value.title === "string"
+  );
+}
+
+/** @param {any} value @returns {boolean} */
+function isHistoryEntry(value) {
+  return (
+    value &&
+    typeof value === "object" &&
+    (value.decision === "keep" || value.decision === "throw")
+  );
+}
+
+/** @returns {Promise<SessionState>} */
+async function readSessionState() {
+  const raw = await browser.storage.session.get([
+    "queue", "cursor", "history", "duplicatesClosedTotal", "filterQuery", "sessionActive",
+  ]);
+  return normaliseSessionState(raw);
+}
+
 async function buildQueue(selfTabId) {
   const settings = await getSettings();
   const tabs = await browser.tabs.query({});
@@ -260,20 +413,7 @@ async function buildQueue(selfTabId) {
   const entries = tabs
     .filter((t) => t.id !== selfTabId)
     .filter((t) => settings.includePinned || !t.pinned)
-    .map((t) => {
-      const domain = computeDomain(t.url);
-      return {
-        tabId: t.id,
-        windowId: t.windowId,
-        url: t.url,
-        title: t.title || t.url,
-        domain,
-        repoKey: computeRepoKey(t.url, domain),
-        pinned: !!t.pinned,
-        discarded: !!t.discarded,
-        lastAccessed: t.lastAccessed || 0,
-      };
-    });
+    .map((t) => tabToQueueEntry(t));
 
   if (settings.sortOrder === "lru") {
     entries.sort((a, b) => a.lastAccessed - b.lastAccessed);
@@ -387,20 +527,7 @@ async function mergeNewTabs(selfTabId) {
     .filter((t) => t.id !== selfTabId)
     .filter((t) => settings.includePinned || !t.pinned)
     .filter((t) => !knownTabIds.has(t.id))
-    .map((t) => {
-      const domain = computeDomain(t.url);
-      return {
-        tabId: t.id,
-        windowId: t.windowId,
-        url: t.url,
-        title: t.title || t.url,
-        domain,
-        repoKey: computeRepoKey(t.url, domain),
-        pinned: !!t.pinned,
-        discarded: !!t.discarded,
-        lastAccessed: t.lastAccessed || 0,
-      };
-    });
+    .map((t) => tabToQueueEntry(t));
 
   if (newEntries.length === 0) return 0;
 
@@ -596,13 +723,11 @@ async function render() {
   // next click on it would fire it with no warning.
   disarmConfirm();
 
-  const { history, duplicatesClosedTotal } = await browser.storage.session.get([
-    "history", "duplicatesClosedTotal",
-  ]);
+  const { history, duplicatesClosedTotal } = await readSessionState();
   const view = await getView();
   const entries = view.entries;
-  const reviewedCount = (history || []).length;
-  const dupCount = duplicatesClosedTotal || 0;
+  const reviewedCount = history.length;
+  const dupCount = duplicatesClosedTotal;
 
   els.progress.textContent =
     `${entries.length} tab${entries.length === 1 ? "" : "s"} in queue \u00b7 ` +
@@ -640,11 +765,11 @@ async function render() {
     els.actionRow.hidden = true;
     const enteringSummary = els.summaryCard.hidden;
     els.summaryCard.hidden = false;
-    renderSummary(history || [], dupCount);
+    renderSummary(history, dupCount);
     if (enteringSummary) {
       els.summaryRestartBtn.focus();
-      const kept = (history || []).filter((h) => h.decision === "keep").length;
-      const thrown = (history || []).filter((h) => h.decision === "throw").length;
+      const kept = history.filter((h) => h.decision === "keep").length;
+      const thrown = history.filter((h) => h.decision === "throw").length;
       announce(`Review complete. ${kept} kept, ${thrown} thrown.`);
     }
     return;
@@ -844,18 +969,11 @@ async function undoLastClose() {
       // edge case. item.url/item.title were captured before the tab was
       // ever closed, so they're already ground truth -- no need to trust
       // (or poll around) the freshly-restored tab for those two fields.
-      const domain = computeDomain(item.url);
-      const restoredEntry = {
-        tabId: restoredTab.id,
-        windowId: restoredTab.windowId,
+      const restoredEntry = tabToQueueEntry(restoredTab, {
         url: item.url,
         title: item.title,
-        domain,
-        repoKey: computeRepoKey(item.url, domain),
-        pinned: !!restoredTab.pinned,
-        discarded: !!restoredTab.discarded,
         lastAccessed: restoredTab.lastAccessed || Date.now(),
-      };
+      });
       (item.wasCurrent ? restoredCurrent : restoredOthers).push(restoredEntry);
     } catch (err) {
       console.warn("Tab Decider: couldn't restore a tab", err);
@@ -983,16 +1101,34 @@ async function closeTabIfStillMatching(tabId, expectedUrl) {
   }
 }
 
+/**
+ * Closes a batch of duplicate matches concurrently rather than one round-trip
+ * at a time -- with 20 duplicates the serial version meant 20 sequential
+ * awaits. Each close still goes through closeTabIfStillMatching, so the
+ * stale-URL guard is preserved; allSettled means one rejection can't abandon
+ * the rest of the batch.
+ * @param {DuplicateMatch[]} matches
+ * @returns {Promise<ClosedItem[]>}
+ */
+async function closeMatchesInParallel(matches) {
+  const results = await Promise.allSettled(
+    matches.map((m) => closeTabIfStillMatching(m.tabId, m.url))
+  );
+  /** @type {ClosedItem[]} */
+  const closed = [];
+  results.forEach((result, i) => {
+    if (result.status === "fulfilled" && result.value === true) {
+      closed.push({ url: matches[i].url, title: matches[i].title, wasCurrent: false });
+    }
+  });
+  return closed;
+}
+
 async function closeDuplicates() {
   const toClose = currentDuplicateMatches.filter((m) => m.checked);
   if (toClose.length === 0) return;
 
-  const closedItems = [];
-  for (const m of toClose) {
-    if (await closeTabIfStillMatching(m.tabId, m.url)) {
-      closedItems.push({ url: m.url, title: m.title, wasCurrent: false });
-    }
-  }
+  const closedItems = await closeMatchesInParallel(toClose);
 
   // Count only what actually closed, not what we attempted -- a failed
   // tabs.remove() used to still inflate the session total (and the notice).
@@ -1034,13 +1170,9 @@ async function throwAllDuplicates() {
   } catch (err) {
     console.warn("Tab Decider: throw-all failed on current tab", err);
   }
-  let duplicatesClosedCount = 0;
-  for (const m of matches) {
-    if (await closeTabIfStillMatching(m.tabId, m.url)) {
-      closedItems.push({ url: m.url, title: m.title, wasCurrent: false });
-      duplicatesClosedCount++;
-    }
-  }
+  const closedDuplicates = await closeMatchesInParallel(matches);
+  closedItems.push(...closedDuplicates);
+  const duplicatesClosedCount = closedDuplicates.length;
 
   const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
   await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + duplicatesClosedCount });
@@ -1145,12 +1277,10 @@ function resolveViewPosition(matchIndices, cursor) {
 // Single place that resolves "what is the user actually looking at right
 // now", so render() and every navigation path agree.
 async function getView() {
-  const { queue, cursor, filterQuery } = await browser.storage.session.get([
-    "queue", "cursor", "filterQuery",
-  ]);
-  const entries = queue || [];
-  const query = filterQuery || "";
-  const rawCursor = cursor || 0;
+  const { queue, cursor, filterQuery } = await readSessionState();
+  const entries = queue;
+  const query = filterQuery;
+  const rawCursor = cursor;
 
   const matchIndices = computeMatchIndices(entries, query);
   if (matchIndices === null) {
@@ -1389,4 +1519,12 @@ async function init() {
   document.addEventListener("keydown", onPageKeydown);
 }
 
-init();
+init().catch((error) => {
+  // Without this, a failure in init leaves the page sitting on "Loading..."
+  // forever with no indication that anything went wrong.
+  console.error("Tab Decider failed to initialise", error);
+  const progress = document.getElementById("progress");
+  if (progress) {
+    progress.textContent = "Tab Decider could not start -- see the browser console for details.";
+  }
+});
