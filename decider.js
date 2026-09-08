@@ -43,6 +43,7 @@
 /**
  * @typedef {"keep" | "throw"} DecisionAction
  * @typedef {"lru" | "tab-order"} SortOrder
+ * @typedef {"closed" | "gone" | "mismatch"} CloseResult
  */
 
 /**
@@ -419,14 +420,19 @@ async function buildQueue(selfTabId) {
     entries.sort((a, b) => a.lastAccessed - b.lastAccessed);
   }
 
+  // Under the lock even though it's a blind write, not a read-modify-write:
+  // a background prune that read the OLD queue and lands after this one would
+  // otherwise overwrite the fresh queue with a stale one.
   try {
-    await browser.storage.session.set({
-      queue: entries,
-      history: [],
-      cursor: 0,
-      duplicatesClosedTotal: 0,
-      sessionActive: true,
-    });
+    await withQueueLock(() =>
+      browser.storage.session.set({
+        queue: entries,
+        history: [],
+        cursor: 0,
+        duplicatesClosedTotal: 0,
+        sessionActive: true,
+      })
+    );
   } catch (err) {
     els.progress.textContent = `Couldn't save the queue: ${err.message}`;
     throw err;
@@ -513,30 +519,36 @@ async function handleResetClick() {
 // but still open) is never re-added.
 async function mergeNewTabs(selfTabId) {
   const settings = await getSettings();
-  const { queue, history } = await browser.storage.session.get(["queue", "history"]);
-  const entries = queue || [];
-  const hist = history || [];
-
-  const knownTabIds = new Set(entries.map((e) => e.tabId));
-  for (const h of hist) {
-    if (h.tabId != null) knownTabIds.add(h.tabId);
-  }
-
   const liveTabs = await browser.tabs.query({});
-  const newEntries = liveTabs
-    .filter((t) => t.id !== selfTabId)
-    .filter((t) => settings.includePinned || !t.pinned)
-    .filter((t) => !knownTabIds.has(t.id))
-    .map((t) => tabToQueueEntry(t));
 
-  if (newEntries.length === 0) return 0;
+  // The read of `queue` and the write back are both inside the lock: a
+  // background prune landing between them would otherwise be undone by the
+  // write, putting a tab the user just closed back in the queue.
+  return withQueueLock(async () => {
+    const { queue, history } = await browser.storage.session.get(["queue", "history"]);
+    const entries = queue || [];
+    const hist = history || [];
 
-  if (settings.sortOrder === "lru") {
-    newEntries.sort((a, b) => a.lastAccessed - b.lastAccessed);
-  }
+    const knownTabIds = new Set(entries.map((e) => e.tabId));
+    for (const h of hist) {
+      if (h.tabId != null) knownTabIds.add(h.tabId);
+    }
 
-  await browser.storage.session.set({ queue: [...entries, ...newEntries] });
-  return newEntries.length;
+    const newEntries = liveTabs
+      .filter((t) => t.id !== selfTabId)
+      .filter((t) => settings.includePinned || !t.pinned)
+      .filter((t) => !knownTabIds.has(t.id))
+      .map((t) => tabToQueueEntry(t));
+
+    if (newEntries.length === 0) return 0;
+
+    if (settings.sortOrder === "lru") {
+      newEntries.sort((a, b) => a.lastAccessed - b.lastAccessed);
+    }
+
+    await browser.storage.session.set({ queue: [...entries, ...newEntries] });
+    return newEntries.length;
+  });
 }
 
 function makeBadge(text, extraClass) {
@@ -949,9 +961,7 @@ async function captureClosedForUndo(closedItems, historyEntriesToRemove, duplica
 // newly-appeared tab. Also rolls back the history/duplicate-count
 // bookkeeping so the session summary stays accurate.
 async function undoLastClose() {
-  const { lastClosedAction, queue, cursor, history, duplicatesClosedTotal } = await browser.storage.session.get([
-    "lastClosedAction", "queue", "cursor", "history", "duplicatesClosedTotal",
-  ]);
+  const { lastClosedAction } = await browser.storage.session.get("lastClosedAction");
   if (!lastClosedAction) return;
 
   const restoredCurrent = [];
@@ -987,22 +997,31 @@ async function undoLastClose() {
     return;
   }
 
-  const entries = queue || [];
-  const pos = cursor || 0;
-  const nextQueue = [...entries.slice(0, pos), ...restoredCurrent, ...entries.slice(pos), ...restoredOthers];
+  // The restores above are a sessions.restore() round-trip per tab, far too
+  // slow to hold the queue lock across -- so the queue is read inside the
+  // lock instead, and the write reflects whatever it looks like by the time
+  // we actually hold it.
+  await withQueueLock(async () => {
+    const { queue, cursor, history, duplicatesClosedTotal } = await browser.storage.session.get([
+      "queue", "cursor", "history", "duplicatesClosedTotal",
+    ]);
+    const entries = queue || [];
+    const pos = cursor || 0;
+    const nextQueue = [...entries.slice(0, pos), ...restoredCurrent, ...entries.slice(pos), ...restoredOthers];
 
-  const hist = (history || []).slice();
-  for (let i = 0; i < lastClosedAction.historyEntriesToRemove && hist.length; i++) {
-    hist.pop();
-  }
-  const nextDupTotal = Math.max(0, (duplicatesClosedTotal || 0) - lastClosedAction.duplicatesToUncount);
+    const hist = (history || []).slice();
+    for (let i = 0; i < lastClosedAction.historyEntriesToRemove && hist.length; i++) {
+      hist.pop();
+    }
+    const nextDupTotal = Math.max(0, (duplicatesClosedTotal || 0) - lastClosedAction.duplicatesToUncount);
 
-  await browser.storage.session.set({
-    queue: nextQueue,
-    cursor: pos,
-    history: hist,
-    duplicatesClosedTotal: nextDupTotal,
-    lastClosedAction: null,
+    await browser.storage.session.set({
+      queue: nextQueue,
+      cursor: pos,
+      history: hist,
+      duplicatesClosedTotal: nextDupTotal,
+      lastClosedAction: null,
+    });
   });
 
   await render();
@@ -1059,25 +1078,78 @@ async function decide(action) {
   }
 }
 
+// `queue` has two writers in two contexts: this page, and background.js's
+// tabs.onRemoved pruning. Both read it, edit it, and write the whole array
+// back, so a page write that reads before a background write and lands after
+// it puts back whatever the background just removed. Closing one tab was
+// survivable (both sides compute the same end state), but "Throw all" closes
+// the current tab AND its duplicates, so the clobber resurrected every
+// duplicate in the batch as a dead entry.
+//
+// background.js owns the lock; taking it parks an entry on the same chain its
+// own writes run through, so neither side can read a queue the other is about
+// to replace. Every read-modify-write of `queue` on this page goes through
+// here -- a lock only some writers take isn't a lock.
+//
+// Page-local calls are chained too: that keeps this page to one outstanding
+// lease, since a second acquire while we already hold one would wait on a
+// chain that only our own release can unblock.
+let pageQueueWrite = Promise.resolve();
+
+/**
+ * @template T
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+function withQueueLock(fn) {
+  const run = async () => {
+    let locked = false;
+    try {
+      await browser.runtime.sendMessage({ type: "queue-lock" });
+      locked = true;
+    } catch (err) {
+      // No background context to coordinate with (it was reloaded, or the
+      // extension is shutting down). Proceeding unlocked is what the code did
+      // before the lock existed -- better than dropping a decision the user
+      // just made.
+      console.warn("Tab Decider: queue lock unavailable, proceeding unlocked", err);
+    }
+    try {
+      return await fn();
+    } finally {
+      if (locked) {
+        try {
+          await browser.runtime.sendMessage({ type: "queue-unlock" });
+        } catch (err) {
+          // Background is gone; its watchdog would have released this anyway.
+        }
+      }
+    }
+  };
+  pageQueueWrite = pageQueueWrite.catch(() => {}).then(run);
+  return pageQueueWrite;
+}
+
 // Re-reads storage right before writing (rather than trusting the entry
-// captured earlier) since background.js's tabs.onRemoved pruning can race
-// with this for the Throw case. Both compute the same end state (entry
-// gone, cursor adjusted the same way) so whichever writes last is fine.
+// captured earlier) since the queue can have changed since -- most often
+// because background.js pruned a tab closed outside the extension.
 async function finalizeDecision(entry, action) {
-  const { queue, cursor, history } = await browser.storage.session.get(["queue", "cursor", "history"]);
-  const entries = queue || [];
-  const pos = cursor || 0;
-  const idx = entries.findIndex((e) => e.tabId === entry.tabId);
+  await withQueueLock(async () => {
+    const { queue, cursor, history } = await browser.storage.session.get(["queue", "cursor", "history"]);
+    const entries = queue || [];
+    const pos = cursor || 0;
+    const idx = entries.findIndex((e) => e.tabId === entry.tabId);
 
-  const nextQueue = idx === -1 ? entries : entries.filter((e) => e.tabId !== entry.tabId);
-  const nextCursor = idx !== -1 && idx < pos ? Math.max(0, pos - 1) : pos;
+    const nextQueue = idx === -1 ? entries : entries.filter((e) => e.tabId !== entry.tabId);
+    const nextCursor = idx !== -1 && idx < pos ? Math.max(0, pos - 1) : pos;
 
-  const historyEntry = { tabId: entry.tabId, url: entry.url, title: entry.title, decision: action, decidedAt: Date.now() };
+    const historyEntry = { tabId: entry.tabId, url: entry.url, title: entry.title, decision: action, decidedAt: Date.now() };
 
-  await browser.storage.session.set({
-    queue: nextQueue,
-    cursor: nextCursor,
-    history: [...(history || []), historyEntry],
+    await browser.storage.session.set({
+      queue: nextQueue,
+      cursor: nextCursor,
+      history: [...(history || []), historyEntry],
+    });
   });
   await render();
 }
@@ -1086,19 +1158,61 @@ async function finalizeDecision(entry, action) {
 // that navigated since then could be matched as a duplicate on a URL it no
 // longer has. Closing is destructive, so confirm against the live tab first
 // -- a stale match then costs nothing worse than a skipped row.
+//
+// The two non-close outcomes are NOT the same and mustn't be collapsed into
+// one falsy value: "mismatch" is a live tab the user hasn't decided on, so it
+// stays in the queue, while "gone" is proof the entry is dead and should be
+// pruned (see closeMatchesInParallel).
+/**
+ * @param {number} tabId
+ * @param {string} expectedUrl
+ * @returns {Promise<CloseResult>}
+ */
 async function closeTabIfStillMatching(tabId, expectedUrl) {
+  let live;
   try {
-    const live = await browser.tabs.get(tabId);
-    if (live.url !== expectedUrl) {
-      console.warn("Tab Decider: skipping close, tab no longer matches", { tabId, expectedUrl, actual: live.url });
-      return false;
-    }
-    await browser.tabs.remove(tabId);
-    return true;
-  } catch (err) {
-    console.warn("Tab Decider: close failed", err);
-    return false;
+    live = await browser.tabs.get(tabId);
+  } catch {
+    return "gone";
   }
+
+  if (live.url !== expectedUrl) {
+    console.warn("Tab Decider: skipping close, tab no longer matches", { tabId, expectedUrl, actual: live.url });
+    return "mismatch";
+  }
+
+  try {
+    await browser.tabs.remove(tabId);
+    return "closed";
+  } catch (err) {
+    // The tab existed a moment ago, so this is a genuine failure rather than
+    // a stale entry -- leave it in the queue and say so.
+    console.warn("Tab Decider: close failed", err);
+    return "mismatch";
+  }
+}
+
+// Drops a batch of entries from the queue in ONE read-modify-write, so a
+// multi-tab prune can't lose updates to itself the way per-tab writes can.
+// Mirrors finalizeDecision's cursor handling: entries removed from before the
+// cursor shift it back, so it keeps pointing at the same logical entry.
+/** @param {number[]} tabIds */
+async function pruneFromQueue(tabIds) {
+  const dead = new Set(tabIds);
+  await withQueueLock(async () => {
+    const { queue, cursor } = await browser.storage.session.get(["queue", "cursor"]);
+    const entries = queue || [];
+    const pos = cursor || 0;
+
+    const nextQueue = entries.filter((e) => !dead.has(e.tabId));
+    if (nextQueue.length === entries.length) return;
+
+    const removedBeforeCursor = entries.filter((e, i) => i < pos && dead.has(e.tabId)).length;
+    await browser.storage.session.set({
+      queue: nextQueue,
+      cursor: Math.max(0, pos - removedBeforeCursor),
+    });
+  });
 }
 
 /**
@@ -1107,6 +1221,13 @@ async function closeTabIfStillMatching(tabId, expectedUrl) {
  * awaits. Each close still goes through closeTabIfStillMatching, so the
  * stale-URL guard is preserved; allSettled means one rejection can't abandon
  * the rest of the batch.
+ *
+ * Matches whose tab turned out to be already gone are pruned from the queue
+ * here. Without that, a queue entry left behind by a lost onRemoved update
+ * stayed a permanent phantom duplicate: it kept appearing in the panel and
+ * every close attempt just re-logged "Invalid tab ID" until the browser
+ * restarted. They're pruned but NOT reported as closed -- we didn't close
+ * them, so they must not inflate duplicatesClosedTotal or the undo snapshot.
  * @param {DuplicateMatch[]} matches
  * @returns {Promise<ClosedItem[]>}
  */
@@ -1116,11 +1237,17 @@ async function closeMatchesInParallel(matches) {
   );
   /** @type {ClosedItem[]} */
   const closed = [];
+  /** @type {number[]} */
+  const deadIds = [];
   results.forEach((result, i) => {
-    if (result.status === "fulfilled" && result.value === true) {
+    if (result.status !== "fulfilled") return;
+    if (result.value === "closed") {
       closed.push({ url: matches[i].url, title: matches[i].title, wasCurrent: false });
+    } else if (result.value === "gone") {
+      deadIds.push(matches[i].tabId);
     }
   });
+  if (deadIds.length > 0) await pruneFromQueue(deadIds);
   return closed;
 }
 
@@ -1192,34 +1319,43 @@ async function throwAllDuplicates() {
 // other pending entry matching some key on the current entry, and move them
 // to right after it," just with a different key (domain vs. repo).
 async function bumpSiblingsBy(getKey, describeGroup) {
-  const view = await getView();
-  const entries = view.entries.slice();
-  const pos = view.queueIndex; // full-queue index, not the filtered position
-  const entry = view.entry;
-  const key = entry && getKey(entry);
-  if (!entry || pos < 0 || !key) return;
+  // Reorders the whole queue, so the view it works from has to be read under
+  // the lock -- reordering a stale copy would reinstate any entry the
+  // background pruned while we were computing the new order.
+  const moved = await withQueueLock(async () => {
+    const view = await getView();
+    const entries = view.entries.slice();
+    const pos = view.queueIndex; // full-queue index, not the filtered position
+    const entry = view.entry;
+    const key = entry && getKey(entry);
+    if (!entry || pos < 0 || !key) return null;
 
-  const siblingIndexes = [];
-  entries.forEach((e, i) => {
-    if (i !== pos && getKey(e) === key) siblingIndexes.push(i);
+    const siblingIndexes = [];
+    entries.forEach((e, i) => {
+      if (i !== pos && getKey(e) === key) siblingIndexes.push(i);
+    });
+    if (siblingIndexes.length === 0) return null;
+
+    // Remove from the end first so earlier removals don't shift indexes we
+    // still need to pull out.
+    const siblings = [];
+    for (let i = siblingIndexes.length - 1; i >= 0; i--) {
+      siblings.unshift(entries.splice(siblingIndexes[i], 1)[0]);
+    }
+
+    const removedBeforePos = siblingIndexes.filter((i) => i < pos).length;
+    const newPos = pos - removedBeforePos;
+    entries.splice(newPos + 1, 0, ...siblings);
+
+    await browser.storage.session.set({ queue: entries, cursor: newPos });
+    return { count: siblings.length, entry };
   });
-  if (siblingIndexes.length === 0) return;
 
-  // Remove from the end first so earlier removals don't shift indexes we
-  // still need to pull out.
-  const siblings = [];
-  for (let i = siblingIndexes.length - 1; i >= 0; i--) {
-    siblings.unshift(entries.splice(siblingIndexes[i], 1)[0]);
-  }
+  if (!moved) return;
 
-  const removedBeforePos = siblingIndexes.filter((i) => i < pos).length;
-  const newPos = pos - removedBeforePos;
-  entries.splice(newPos + 1, 0, ...siblings);
-
-  await browser.storage.session.set({ queue: entries, cursor: newPos });
   await render();
   showNotice(
-    `Moved ${siblings.length} tab${siblings.length === 1 ? "" : "s"} from ${describeGroup(entry)} to review right after this one.`
+    `Moved ${moved.count} tab${moved.count === 1 ? "" : "s"} from ${describeGroup(moved.entry)} to review right after this one.`
   );
 }
 
