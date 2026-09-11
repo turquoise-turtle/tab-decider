@@ -219,6 +219,51 @@ function computeDomain(url) {
   }
 }
 
+// Matched against a tracking param's key, not its value -- covers utm_source,
+// utm_medium, etc. in one check. Deliberately short: this is for finding
+// duplicates, not for a general URL-cleaning feature, so it only strips the
+// param family common enough to be the difference between two tabs that are
+// otherwise the same page.
+const TRACKING_PARAM_RE = /^utm_/i;
+
+// renderDuplicates used to match `e.url === entry.url`, which only catches
+// byte-identical URLs. With ~2,000 tabs in a real queue, the near-misses --
+// a trailing slash, a #fragment, a utm_* param, http vs. https -- are where
+// most of the actual duplicates live, and every one of them slipped through
+// exact matching. This key is for FINDING duplicates only: the raw URL is
+// still what's displayed (renderDuplicates keeps `e.url`, not this), and
+// closeTabIfStillMatching still confirms each tab's own exact URL against
+// its own earlier snapshot before closing it -- normalizing the match key
+// doesn't loosen that check at all.
+function normalizeForDupes(rawUrl) {
+  let u;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return rawUrl; // not a real URL (about:blank, etc.) -- compare as-is
+  }
+
+  // http and https are the same page to a human deciding whether two tabs
+  // are "the same tab", so they're folded together for matching purposes.
+  const scheme = u.protocol === "http:" ? "https:" : u.protocol;
+  const host = u.hostname.toLowerCase();
+  // A bare-root trailing slash and no path at all are the same address --
+  // strip any trailing slash the same way, root included.
+  const path = u.pathname.replace(/\/$/, "");
+
+  const params = new URLSearchParams(u.search);
+  for (const key of [...params.keys()]) {
+    if (TRACKING_PARAM_RE.test(key)) params.delete(key);
+  }
+  params.sort();
+  const query = params.toString();
+
+  // #fragment is dropped entirely: it's far more often a same-document
+  // anchor (or a stale one left over from a share link) than it is a
+  // distinct page, and that outweighs the rare SPA that hash-routes.
+  return `${scheme}//${host}${path}${query ? `?${query}` : ""}`;
+}
+
 const GIT_HOSTS = new Set(["github.com", "gitlab.com", "codeberg.org"]);
 
 // A handful of top-level path segments that look like a username/org but
@@ -512,22 +557,24 @@ async function handleResetClick() {
 
 // Runs instead of buildQueue() when a session is already active (e.g. the
 // decider page was just reloaded, not opened fresh after a browser
-// restart). Leaves cursor, history, and existing queue entries completely
-// untouched -- anything newly opened since the queue was built just gets
-// appended to the end. A tab already sitting in `queue` OR already decided
-// in `history` (most importantly: a Kept tab, which is removed from queue
-// but still open) is never re-added.
+// restart). Leaves history and existing queue entries otherwise untouched --
+// anything newly opened since the queue was built just gets appended to the
+// end. A tab already sitting in `queue` OR already decided in `history`
+// (most importantly: a Kept tab, which is removed from queue but still open)
+// is never re-added.
 async function mergeNewTabs(selfTabId) {
   const settings = await getSettings();
   const liveTabs = await browser.tabs.query({});
+  const liveTabIds = new Set(liveTabs.map((t) => t.id));
 
   // The read of `queue` and the write back are both inside the lock: a
   // background prune landing between them would otherwise be undone by the
   // write, putting a tab the user just closed back in the queue.
   return withQueueLock(async () => {
-    const { queue, history } = await browser.storage.session.get(["queue", "history"]);
+    const { queue, cursor, history } = await browser.storage.session.get(["queue", "cursor", "history"]);
     const entries = queue || [];
     const hist = history || [];
+    const pos = cursor || 0;
 
     const knownTabIds = new Set(entries.map((e) => e.tabId));
     for (const h of hist) {
@@ -540,14 +587,33 @@ async function mergeNewTabs(selfTabId) {
       .filter((t) => !knownTabIds.has(t.id))
       .map((t) => tabToQueueEntry(t));
 
-    if (newEntries.length === 0) return 0;
-
     if (settings.sortOrder === "lru") {
       newEntries.sort((a, b) => a.lastAccessed - b.lastAccessed);
     }
 
-    await browser.storage.session.set({ queue: [...entries, ...newEntries] });
-    return newEntries.length;
+    // Session storage outlives a suspended MV3 event page, so a tab that
+    // closed while background.js's onRemoved listener wasn't running never
+    // got pruned -- it just sits in `queue` as a dead entry, matched as a
+    // phantom duplicate and failing "Invalid tab ID" on every close attempt
+    // until something notices. This function already builds the live-tab
+    // set for the opposite check (finding new tabs), so checking survival
+    // here is one more filter and makes every page load self-healing rather
+    // than only the close path (see closeMatchesInParallel/pruneFromQueue).
+    let removedBeforeCursor = 0;
+    const survivors = entries.filter((e, i) => {
+      if (liveTabIds.has(e.tabId)) return true;
+      if (i < pos) removedBeforeCursor++;
+      return false;
+    });
+    const prunedCount = entries.length - survivors.length;
+
+    if (newEntries.length === 0 && prunedCount === 0) return { added: 0, pruned: 0 };
+
+    await browser.storage.session.set({
+      queue: [...survivors, ...newEntries],
+      cursor: Math.max(0, pos - removedBeforeCursor),
+    });
+    return { added: newEntries.length, pruned: prunedCount };
   });
 }
 
@@ -633,6 +699,10 @@ function renderCurrentCard(entry, liveTab) {
 // closeDuplicates/throwAllDuplicates re-verify against the live tab before
 // actually closing anything, so a stale match can't cause a wrong close --
 // it can only cause a stale row to appear here briefly.
+//
+// Matching is via normalizeForDupes, not raw equality -- see its comment.
+// Everything shown in the panel (url, title) is still the untouched value
+// from the entry, never the normalized key.
 function renderDuplicates(entry, entries) {
   if (!entry) {
     els.duplicatePanel.hidden = true;
@@ -640,8 +710,9 @@ function renderDuplicates(entry, entries) {
     return;
   }
 
+  const entryKey = normalizeForDupes(entry.url);
   const matches = entries
-    .filter((e) => e.url === entry.url && e.tabId !== entry.tabId)
+    .filter((e) => e.tabId !== entry.tabId && normalizeForDupes(e.url) === entryKey)
     .map((e) => ({
       tabId: e.tabId,
       url: e.url,
@@ -659,7 +730,7 @@ function renderDuplicates(entry, entries) {
 
   els.duplicatePanel.hidden = false;
   els.duplicateSummary.textContent =
-    `${matches.length} other open tab${matches.length === 1 ? "" : "s"} match this URL exactly.`;
+    `${matches.length} other open tab${matches.length === 1 ? "" : "s"} look like the same page.`;
 
   els.duplicateList.textContent = "";
   for (const m of matches) {
@@ -1216,6 +1287,13 @@ async function pruneFromQueue(tabIds) {
 }
 
 /**
+ * @typedef {object} CloseBatchResult
+ * @property {ClosedItem[]} closed
+ * @property {number} skipped - live tabs left alone because the URL moved on
+ * @property {number} pruned - dead entries removed from the queue, not closed by us
+ */
+
+/**
  * Closes a batch of duplicate matches concurrently rather than one round-trip
  * at a time -- with 20 duplicates the serial version meant 20 sequential
  * awaits. Each close still goes through closeTabIfStillMatching, so the
@@ -1228,8 +1306,13 @@ async function pruneFromQueue(tabIds) {
  * every close attempt just re-logged "Invalid tab ID" until the browser
  * restarted. They're pruned but NOT reported as closed -- we didn't close
  * them, so they must not inflate duplicatesClosedTotal or the undo snapshot.
+ *
+ * `skipped` and `pruned` are handed back rather than left in the console:
+ * that's the actual lesson of the bug this fixed -- "Closed 0 duplicate
+ * tabs" with the real reason (three dead entries) sitting only in a
+ * console.warn meant the only way to find out what happened was devtools.
  * @param {DuplicateMatch[]} matches
- * @returns {Promise<ClosedItem[]>}
+ * @returns {Promise<CloseBatchResult>}
  */
 async function closeMatchesInParallel(matches) {
   const results = await Promise.allSettled(
@@ -1239,23 +1322,46 @@ async function closeMatchesInParallel(matches) {
   const closed = [];
   /** @type {number[]} */
   const deadIds = [];
+  let skipped = 0;
   results.forEach((result, i) => {
-    if (result.status !== "fulfilled") return;
+    if (result.status !== "fulfilled") {
+      // closeTabIfStillMatching catches its own errors and never rejects, so
+      // this shouldn't happen -- but if it ever does, count it rather than
+      // let the match silently vanish from every total.
+      skipped++;
+      return;
+    }
     if (result.value === "closed") {
       closed.push({ url: matches[i].url, title: matches[i].title, wasCurrent: false });
     } else if (result.value === "gone") {
       deadIds.push(matches[i].tabId);
+    } else {
+      skipped++; // "mismatch" -- still a live, undecided tab; left in the queue on purpose
     }
   });
   if (deadIds.length > 0) await pruneFromQueue(deadIds);
-  return closed;
+  return { closed, skipped, pruned: deadIds.length };
+}
+
+// Turns closeMatchesInParallel's non-"closed" counts into the trailing clause
+// of a notice, so a lower-than-expected count says why right where the user
+// is looking instead of only in the console.
+function describeCloseOutcome(skipped, pruned) {
+  const extra = [];
+  if (skipped > 0) {
+    extra.push(`skipped ${skipped} (navigated away since being checked)`);
+  }
+  if (pruned > 0) {
+    extra.push(`${pruned} had already closed`);
+  }
+  return extra.length > 0 ? `, ${extra.join(", ")}` : "";
 }
 
 async function closeDuplicates() {
   const toClose = currentDuplicateMatches.filter((m) => m.checked);
   if (toClose.length === 0) return;
 
-  const closedItems = await closeMatchesInParallel(toClose);
+  const { closed: closedItems, skipped, pruned } = await closeMatchesInParallel(toClose);
 
   // Count only what actually closed, not what we attempted -- a failed
   // tabs.remove() used to still inflate the session total (and the notice).
@@ -1264,7 +1370,10 @@ async function closeDuplicates() {
 
   await render();
   await captureClosedForUndo(closedItems, 0, closedItems.length);
-  showNotice(`Closed ${closedItems.length} duplicate tab${closedItems.length === 1 ? "" : "s"}.`, true);
+  showNotice(
+    `Closed ${closedItems.length} duplicate tab${closedItems.length === 1 ? "" : "s"}${describeCloseOutcome(skipped, pruned)}.`,
+    true
+  );
 }
 
 // Closes the current entry AND every duplicate match together, regardless
@@ -1297,7 +1406,7 @@ async function throwAllDuplicates() {
   } catch (err) {
     console.warn("Tab Decider: throw-all failed on current tab", err);
   }
-  const closedDuplicates = await closeMatchesInParallel(matches);
+  const { closed: closedDuplicates, skipped, pruned } = await closeMatchesInParallel(matches);
   closedItems.push(...closedDuplicates);
   const duplicatesClosedCount = closedDuplicates.length;
 
@@ -1307,7 +1416,7 @@ async function throwAllDuplicates() {
   await finalizeDecision(entry, "throw");
   await captureClosedForUndo(closedItems, 1, duplicatesClosedCount);
   showNotice(
-    `Threw ${closedItems.length} tabs -- this one plus ${duplicatesClosedCount} duplicate${duplicatesClosedCount === 1 ? "" : "s"}.`,
+    `Threw ${closedItems.length} tabs -- this one plus ${duplicatesClosedCount} duplicate${duplicatesClosedCount === 1 ? "" : "s"}${describeCloseOutcome(skipped, pruned)}.`,
     true
   );
 }
@@ -1573,19 +1682,26 @@ async function init() {
   await renderShortcutsList();
 
   const { sessionActive } = await browser.storage.session.get("sessionActive");
-  let addedCount = 0;
+  let merged = { added: 0, pruned: 0 };
   if (!sessionActive) {
     await buildQueue(selfTab.id);
   } else {
     // Reloading the page (not a browser restart) shouldn't lose your
     // position or rebuild from scratch -- just pick up anything opened
-    // since the queue was last built and tack it onto the end.
-    addedCount = await mergeNewTabs(selfTab.id);
+    // since the queue was last built and tack it onto the end, and drop
+    // anything that closed while this page (and background.js's listener)
+    // wasn't around to notice.
+    merged = await mergeNewTabs(selfTab.id);
   }
   await render();
-  if (addedCount > 0) {
-    showNotice(`Added ${addedCount} new tab${addedCount === 1 ? "" : "s"} to the end of the queue.`);
+  const noticeParts = [];
+  if (merged.added > 0) {
+    noticeParts.push(`Added ${merged.added} new tab${merged.added === 1 ? "" : "s"} to the end of the queue.`);
   }
+  if (merged.pruned > 0) {
+    noticeParts.push(`Removed ${merged.pruned} tab${merged.pruned === 1 ? "" : "s"} that had already closed.`);
+  }
+  if (noticeParts.length > 0) showNotice(noticeParts.join(" "));
 
   // Keyboard shortcuts are handled in background.js (global commands work
   // regardless of which tab has focus) and relayed here as a message, so
