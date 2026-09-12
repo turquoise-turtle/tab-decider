@@ -18,10 +18,15 @@ so nothing else in this manifest or in background.js/decider.js needs to
 change for Chrome -- just a floor on which Chrome this build actually runs on.
 
 The Firefox original is kept untouched as manifest.json.bak; manifest.json
-becomes the Chrome-compatible copy. Safe to run more than once -- it always
-regenerates manifest.json from the .bak (never from its own prior output),
-so re-running doesn't compound conversions or accidentally back up an
-already-converted file.
+becomes the Chrome-compatible copy. Safe to run more than once: if
+manifest.json is currently Firefox-shaped (the normal resting state between
+conversions -- you edit it directly, bump the version, add an icon, whatever),
+that's treated as the fresh source and the .bak is refreshed from it. Only
+when manifest.json is ALREADY Chrome-shaped (mid-conversion, not yet
+restored) does the existing .bak get trusted instead, since at that point
+it's the only copy of the Firefox original left. Without this check, editing
+manifest.json again after a conversion and forgetting to `--restore` first
+would silently convert from a stale .bak and discard the edit.
 
 Usage (from the extension's directory):
     uv run make_chrome_manifest.py            # convert
@@ -40,6 +45,11 @@ from pathlib import Path
 # here specifically because this extension has no devtools_page; that case
 # needed 152.)
 MIN_CHROME_VERSION = "148"
+
+
+def is_firefox_shaped(data: dict) -> bool:
+    background = data.get("background")
+    return isinstance(background, dict) and "scripts" in background
 
 
 def to_chrome_manifest(data: dict) -> dict:
@@ -91,19 +101,29 @@ def main() -> None:
         print(f"restored {manifest_path} from {backup_path}")
         return
 
-    # The .bak is always the source of truth for "the Firefox original" --
-    # regenerating from it, rather than from manifest.json itself, is what
-    # makes this idempotent.
-    if backup_path.exists():
-        source_path = backup_path
-    else:
-        if not manifest_path.exists():
-            sys.exit(f"{manifest_path} not found")
-        shutil.copyfile(manifest_path, backup_path)
-        print(f"backed up original to {backup_path}")
-        source_path = backup_path
+    if not manifest_path.exists():
+        sys.exit(f"{manifest_path} not found")
+    current = json.loads(manifest_path.read_text())
 
-    original = json.loads(source_path.read_text())
+    # manifest.json being Firefox-shaped means it's the live, possibly just
+    # -edited source -- always prefer it and refresh the backup, rather than
+    # trusting a .bak that could predate a version bump, a new icon, whatever
+    # else changed since the last conversion. Only fall back to the .bak when
+    # manifest.json is already Chrome-shaped (converted, not yet restored),
+    # since that's the one case where it's the sole remaining copy.
+    if is_firefox_shaped(current):
+        shutil.copyfile(manifest_path, backup_path)
+        print(f"backed up current Firefox manifest to {backup_path}")
+        original = current
+    elif backup_path.exists():
+        print(f"manifest.json is already Chrome-shaped -- reconverting from {backup_path}")
+        original = json.loads(backup_path.read_text())
+    else:
+        sys.exit(
+            f"{manifest_path} is already Chrome-shaped and no {backup_path} exists "
+            "-- nothing to convert from"
+        )
+
     chrome_manifest = to_chrome_manifest(original)
 
     manifest_path.write_text(json.dumps(chrome_manifest, indent=2) + "\n")
