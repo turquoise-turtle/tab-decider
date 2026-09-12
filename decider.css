@@ -362,6 +362,10 @@ select:focus-visible {
 .stat-label { font-size: 13px; color: var(--text-muted); }
 .summary-card .btn-keep { padding: 10px 24px; font-size: 14px; font-weight: 600; }
 
+/* #duplicate-tab-panel reuses .summary-card for the box itself -- same
+   "one centered message, one prominent button" shape as session-complete. */
+#duplicate-tab-text { margin: 0 0 24px; color: var(--text-muted); }
+
 #action-row {
   display: flex;
   gap: 12px;

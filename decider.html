@@ -50,6 +50,18 @@
     </div>
   </div>
 
+  <!-- Shown instead of #review-main when this page finds a DIFFERENT,
+       already-live decider.html tab holding deciderTabId -- e.g. this tab was
+       duplicated, or the URL was pasted into a fresh tab. Every mutex in this
+       file (runExclusive, the pageQueueWrite lock chain) is a module-level
+       variable, so a second live page is invisible to the first one; this
+       stops that second page from ever touching shared state at all. -->
+  <section id="duplicate-tab-panel" class="summary-card" hidden role="alert" aria-label="Tab Decider already open">
+    <h2>Tab Decider is already open</h2>
+    <p id="duplicate-tab-text">Another tab is already reviewing this queue. Using both at once can make them disagree with each other.</p>
+    <button id="duplicate-tab-switch-btn" class="btn-keep">Switch to that tab and close this one</button>
+  </section>
+
   <main id="review-main">
   <!-- Single narrow announcement channel. Replaces aria-live on the whole
        card, which made screen readers re-read title + URL + timestamp + every

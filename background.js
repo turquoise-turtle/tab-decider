@@ -1,6 +1,17 @@
 // @ts-check
 /* global browser */
 
+// Chrome 148+ ships a native, promise-based `browser` namespace matching
+// Firefox's -- including runtime.onMessage listeners returning a Promise
+// instead of the callback-based sendResponse()/return-true dance, which is
+// exactly what relayDecision below depends on. Only Chrome needs this guard;
+// Firefox has always had `browser` as a real global. Duplicated in decider.js
+// -- these are two separate top-level script contexts with no shared module
+// to hold one copy in.
+if (typeof browser === "undefined") {
+  globalThis.browser = chrome;
+}
+
 // background.js — Tab Decider
 //
 // Kept deliberately thin: this file only opens/focuses the decider tab and

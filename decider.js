@@ -40,6 +40,17 @@
 // @ts-check
 /* global browser */
 
+// Chrome 148+ ships a native, promise-based `browser` namespace matching
+// Firefox's -- including runtime.onMessage listeners returning a Promise
+// instead of the callback-based sendResponse()/return-true dance, which is
+// exactly what the "decide" listener near the bottom of this file depends
+// on. Only Chrome needs this guard; Firefox has always had `browser` as a
+// real global. Duplicated in background.js -- these are two separate
+// top-level script contexts with no shared module to hold one copy in.
+if (typeof browser === "undefined") {
+  globalThis.browser = chrome;
+}
+
 /**
  * @typedef {"keep" | "throw"} DecisionAction
  * @typedef {"lru" | "tab-order"} SortOrder
@@ -148,6 +159,9 @@ const els = {
   summaryThrown: document.getElementById("summary-thrown"),
   summaryDuplicates: document.getElementById("summary-duplicates"),
   summaryRestartBtn: /** @type {HTMLButtonElement} */ (document.getElementById("summary-restart-btn")),
+  duplicateTabPanel: document.getElementById("duplicate-tab-panel"),
+  duplicateTabText: document.getElementById("duplicate-tab-text"),
+  duplicateTabSwitchBtn: /** @type {HTMLButtonElement} */ (document.getElementById("duplicate-tab-switch-btn")),
 };
 
 // Transient, recomputed on every render -- not persisted. Just lets the
@@ -164,7 +178,16 @@ const DECISION_ACTIONS = new Set(["keep", "throw"]);
 let actionInProgress = false;
 
 async function runExclusive(operation) {
-  if (actionInProgress) return;
+  if (actionInProgress) {
+    // Dropped, not queued: a Keep/Throw isn't safe to replay later against
+    // whatever entry happens to be current by then. This used to drop with
+    // zero trace anywhere -- a rapid-fire hotkey press (exactly the workflow
+    // this extension is for) could silently do nothing and there was no way
+    // to tell from the UI. Logging is the cheap half of a fix; noting it
+    // out loud to the user is a further step, not done here.
+    console.warn("Tab Decider: action dropped, another is already in progress");
+    return;
+  }
   actionInProgress = true;
   setBusy(true);
   try {
@@ -1034,6 +1057,12 @@ async function captureClosedForUndo(closedItems, historyEntriesToRemove, duplica
 async function undoLastClose() {
   const { lastClosedAction } = await browser.storage.session.get("lastClosedAction");
   if (!lastClosedAction) return;
+  // Identifies exactly the record we're about to undo, so this call clears
+  // ONLY that record even if a second decider tab captures a fresh close
+  // (overwriting lastClosedAction) while the restore loop below is in
+  // flight -- without this, this call's eventual null-write would silently
+  // wipe out the OTHER tab's still-undo-able close instead of its own.
+  const startedAt = lastClosedAction.closedAt;
 
   const restoredCurrent = [];
   const restoredOthers = [];
@@ -1063,7 +1092,14 @@ async function undoLastClose() {
 
   const totalRestored = restoredCurrent.length + restoredOthers.length;
   if (totalRestored === 0) {
-    await browser.storage.session.set({ lastClosedAction: null });
+    // Locked + CAS-guarded for the same reason as the success path below:
+    // only clear the slot if it's still holding OUR record.
+    await withQueueLock(async () => {
+      const { lastClosedAction: current } = await browser.storage.session.get("lastClosedAction");
+      if (current && current.closedAt === startedAt) {
+        await browser.storage.session.set({ lastClosedAction: null });
+      }
+    });
     showNotice("Couldn't undo -- Firefox may have already cleared that from its closed-tabs history.");
     return;
   }
@@ -1073,8 +1109,8 @@ async function undoLastClose() {
   // lock instead, and the write reflects whatever it looks like by the time
   // we actually hold it.
   await withQueueLock(async () => {
-    const { queue, cursor, history, duplicatesClosedTotal } = await browser.storage.session.get([
-      "queue", "cursor", "history", "duplicatesClosedTotal",
+    const { queue, cursor, history, duplicatesClosedTotal, lastClosedAction: current } = await browser.storage.session.get([
+      "queue", "cursor", "history", "duplicatesClosedTotal", "lastClosedAction",
     ]);
     const entries = queue || [];
     const pos = cursor || 0;
@@ -1086,12 +1122,17 @@ async function undoLastClose() {
     }
     const nextDupTotal = Math.max(0, (duplicatesClosedTotal || 0) - lastClosedAction.duplicatesToUncount);
 
+    // Only clear lastClosedAction if it's still the record we started
+    // undoing -- a second tab's close could have replaced it with a fresh,
+    // not-yet-undone one while the restore loop above was running.
+    const stillOurs = current && current.closedAt === startedAt;
+
     await browser.storage.session.set({
       queue: nextQueue,
       cursor: pos,
       history: hist,
       duplicatesClosedTotal: nextDupTotal,
-      lastClosedAction: null,
+      lastClosedAction: stillOurs ? null : current,
     });
   });
 
@@ -1256,8 +1297,20 @@ async function closeTabIfStillMatching(tabId, expectedUrl) {
     await browser.tabs.remove(tabId);
     return "closed";
   } catch (err) {
-    // The tab existed a moment ago, so this is a genuine failure rather than
-    // a stale entry -- leave it in the queue and say so.
+    // tabs.remove can fail for two very different reasons, and they can't be
+    // told apart from the error alone (message text isn't a stable contract
+    // across browser versions/locales): either the tab genuinely closed in
+    // the gap between the tabs.get() above and this call (rare, but real --
+    // another extension, the user's own click, Firefox reclaiming it), or
+    // something else about the removal itself failed while the tab is still
+    // there. Re-checking tells them apart: the former should self-heal like
+    // any other dead entry (see closeMatchesInParallel), not sit in the
+    // queue reporting "navigated away" for a tab that actually just closed.
+    try {
+      await browser.tabs.get(tabId);
+    } catch {
+      return "gone";
+    }
     console.warn("Tab Decider: close failed", err);
     return "mismatch";
   }
@@ -1365,8 +1418,13 @@ async function closeDuplicates() {
 
   // Count only what actually closed, not what we attempted -- a failed
   // tabs.remove() used to still inflate the session total (and the notice).
-  const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
-  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + closedItems.length });
+  // Locked: this is a read-modify-write, and a second decider tab closing
+  // duplicates at the same moment would otherwise race it and undercount --
+  // the exact bug class `queue` itself was fixed for, just on this counter.
+  await withQueueLock(async () => {
+    const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
+    await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + closedItems.length });
+  });
 
   await render();
   await captureClosedForUndo(closedItems, 0, closedItems.length);
@@ -1410,8 +1468,12 @@ async function throwAllDuplicates() {
   closedItems.push(...closedDuplicates);
   const duplicatesClosedCount = closedDuplicates.length;
 
-  const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
-  await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + duplicatesClosedCount });
+  // Locked for the same reason as closeDuplicates: a second decider tab
+  // could otherwise read the same pre-write total and undercount it.
+  await withQueueLock(async () => {
+    const { duplicatesClosedTotal } = await browser.storage.session.get("duplicatesClosedTotal");
+    await browser.storage.session.set({ duplicatesClosedTotal: (duplicatesClosedTotal || 0) + duplicatesClosedCount });
+  });
 
   await finalizeDecision(entry, "throw");
   await captureClosedForUndo(closedItems, 1, duplicatesClosedCount);
@@ -1577,11 +1639,20 @@ let filterDebounceTimer = null;
 
 // Debounced: at ~1,900 entries, re-filtering and re-rendering on every
 // keystroke is enough work to feel laggy while typing.
+//
+// Routed through runExclusive like every other mutation in this file --
+// this used to be the one call site that wasn't. render() can write `cursor`
+// on its own (see the filter-snap comment above), and without this guard a
+// debounced filter render firing mid-decision could read a stale queue
+// snapshot and write that stale cursor back out AFTER the decision's own
+// (correct) write, silently repointing the view at the wrong entry.
 function onFilterInput() {
   clearTimeout(filterDebounceTimer);
-  filterDebounceTimer = setTimeout(async () => {
-    await browser.storage.session.set({ filterQuery: els.filterInput.value.trim() });
-    await render();
+  filterDebounceTimer = setTimeout(() => {
+    runExclusive(async () => {
+      await browser.storage.session.set({ filterQuery: els.filterInput.value.trim() });
+      await render();
+    });
   }, 150);
 }
 
@@ -1626,7 +1697,7 @@ function onPageKeydown(e) {
       return;
     }
     if (isTyping && e.target === els.filterInput) {
-      clearFilter();
+      runExclusive(clearFilter);
       els.filterInput.blur();
       e.preventDefault();
     }
@@ -1662,11 +1733,11 @@ function onPageKeydown(e) {
       e.preventDefault();
       break;
     case "ArrowRight":
-      stepCursor(e.shiftKey ? 10 : 1);
+      runExclusive(() => stepCursor(e.shiftKey ? 10 : 1));
       e.preventDefault();
       break;
     case "ArrowLeft":
-      stepCursor(e.shiftKey ? -10 : -1);
+      runExclusive(() => stepCursor(e.shiftKey ? -10 : -1));
       e.preventDefault();
       break;
     default:
@@ -1674,12 +1745,64 @@ function onPageKeydown(e) {
   }
 }
 
-async function init() {
-  const selfTab = await browser.tabs.getCurrent();
-  await browser.storage.session.set({ deciderTabId: selfTab.id });
+// Mirrors background.js's own findExistingDeciderTab -- same live-tab check
+// (confirm the id still resolves to an open tab actually showing
+// decider.html, not just any tab that happens to have reused the id).
+// Duplicated rather than shared: background.js and this page are separate
+// execution contexts with no module to import between them.
+async function findOtherLiveDeciderTab(selfTabId) {
+  const { deciderTabId } = await browser.storage.session.get("deciderTabId");
+  if (deciderTabId == null || deciderTabId === selfTabId) return null;
+  try {
+    const tab = await browser.tabs.get(deciderTabId);
+    if (tab.url && tab.url.startsWith(browser.runtime.getURL("decider.html"))) return tab;
+  } catch {
+    // Stale id -- that tab is gone, nothing to defer to.
+  }
+  return null;
+}
 
-  await loadSettingsIntoUI();
-  await renderShortcutsList();
+function showDuplicateTabTakeover() {
+  els.reviewMain.hidden = true;
+  els.duplicateTabPanel.hidden = false;
+  // Both live in the header, outside #review-main, so hiding that alone
+  // doesn't reach them -- and both can rewrite the shared queue
+  // (rebuildAndRender via "Forget decisions", or a settings change, which
+  // rebuilds too). Disabling them is the whole point of this panel: a
+  // redundant tab that can still trigger a full rebuild of the other tab's
+  // in-progress queue isn't actually deferring to it.
+  els.settingsToggleBtn.disabled = true;
+  els.resetBtn.disabled = true;
+}
+
+// Brings the other, canonical decider tab forward and closes this redundant
+// one -- the only way this page ever touches shared queue state is by
+// deferring to that tab instead. If the other tab closed in the gap between
+// the check in init() and this click, there's nothing left to defer to:
+// become the decider here rather than closing with no decider tab left open
+// anywhere.
+async function switchToOtherDeciderTab(otherTab, selfTab) {
+  try {
+    await browser.tabs.update(otherTab.id, { active: true });
+    await browser.windows.update(otherTab.windowId, { focused: true });
+  } catch (err) {
+    console.warn("Tab Decider: the other tab is gone, becoming the decider here instead", err);
+    els.duplicateTabPanel.hidden = true;
+    els.reviewMain.hidden = false;
+    els.settingsToggleBtn.disabled = false;
+    els.resetBtn.disabled = false;
+    await becomeDeciderTab(selfTab);
+    return;
+  }
+  await browser.tabs.remove(selfTab.id);
+}
+
+// Everything that makes this page THE decider tab: claiming deciderTabId,
+// building or resuming the queue, and showing the initial notice. Split out
+// from init() so the "other tab is gone" fallback above can re-run it
+// without duplicating this logic.
+async function becomeDeciderTab(selfTab) {
+  await browser.storage.session.set({ deciderTabId: selfTab.id });
 
   const { sessionActive } = await browser.storage.session.get("sessionActive");
   let merged = { added: 0, pruned: 0 };
@@ -1702,6 +1825,31 @@ async function init() {
     noticeParts.push(`Removed ${merged.pruned} tab${merged.pruned === 1 ? "" : "s"} that had already closed.`);
   }
   if (noticeParts.length > 0) showNotice(noticeParts.join(" "));
+}
+
+async function init() {
+  const selfTab = await browser.tabs.getCurrent();
+
+  // Checked before this page touches ANY shared state (deciderTabId
+  // included): every mutex in this file is a module-level variable, so a
+  // second live decider.html page is invisible to the first one and would
+  // otherwise race it on `queue`, `duplicatesClosedTotal`, and
+  // `lastClosedAction` with no coordination at all. Deferring outright, via
+  // the takeover panel below, is cheaper and more reliable than trying to
+  // coordinate two independent pages.
+  const otherTab = await findOtherLiveDeciderTab(selfTab.id);
+  if (otherTab) {
+    showDuplicateTabTakeover();
+  } else {
+    await becomeDeciderTab(selfTab);
+  }
+
+  await loadSettingsIntoUI();
+  await renderShortcutsList();
+
+  els.duplicateTabSwitchBtn.addEventListener("click", () =>
+    runExclusive(() => switchToOtherDeciderTab(otherTab, selfTab))
+  );
 
   // Keyboard shortcuts are handled in background.js (global commands work
   // regardless of which tab has focus) and relayed here as a message, so
@@ -1757,17 +1905,17 @@ async function init() {
   els.domainBumpBtn.addEventListener("click", () => runExclusive(bumpDomainSiblings));
   els.repoBumpBtn.addEventListener("click", () => runExclusive(bumpRepoSiblings));
 
-  els.stepBack10.addEventListener("click", () => stepCursor(-10));
-  els.stepBack1.addEventListener("click", () => stepCursor(-1));
-  els.stepFwd1.addEventListener("click", () => stepCursor(1));
-  els.stepFwd10.addEventListener("click", () => stepCursor(10));
-  els.jumpBtn.addEventListener("click", jumpToInput);
+  els.stepBack10.addEventListener("click", () => runExclusive(() => stepCursor(-10)));
+  els.stepBack1.addEventListener("click", () => runExclusive(() => stepCursor(-1)));
+  els.stepFwd1.addEventListener("click", () => runExclusive(() => stepCursor(1)));
+  els.stepFwd10.addEventListener("click", () => runExclusive(() => stepCursor(10)));
+  els.jumpBtn.addEventListener("click", () => runExclusive(jumpToInput));
   els.jumpInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") jumpToInput();
+    if (e.key === "Enter") runExclusive(jumpToInput);
   });
 
   els.filterInput.addEventListener("input", onFilterInput);
-  els.filterClearBtn.addEventListener("click", clearFilter);
+  els.filterClearBtn.addEventListener("click", () => runExclusive(clearFilter));
   document.addEventListener("keydown", onPageKeydown);
 }
 
